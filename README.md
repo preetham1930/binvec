@@ -12,6 +12,9 @@ Approximate nearest-neighbour search over large vector sets on a single machine,
 > **Against FAISS** (Deep 10M, same laptop): as fast as FAISS's fastest IVF index per query at
 > 0.985–0.999 recall, with 5× less RAM; FAISS has higher batch throughput.
 
+**Design notes:** [docs/DESIGN.md](docs/DESIGN.md): the decisions, in order, each with the
+measurement that drove it.
+
 Every number below comes from a CSV in `results/`, written by `binvec bench`, with ground truth
 from the [NeurIPS'21 Big-ANN benchmark](https://big-ann-benchmarks.com/neurips21.html).
 Machine: Dell Inspiron 16 7610, i7-11800H (8 cores), 16 GB RAM, NVMe SSD, WSL2 (Kali) with 11 GB
@@ -332,7 +335,10 @@ $B fbench --index data/syn1m/idx.bin --base data/syn1m/base.fbin --refine data/s
 - [x] SIMD (FastScan) scan kernel, reservoir collector, vectorised refine
 - [x] Filtered search: in-scan filter, inverted index, cost-based planner
 - [x] Head-to-head with FAISS on the same machine
-- [ ] Write-up
+- [x] Write-up: [docs/DESIGN.md](docs/DESIGN.md)
+
+Next (not started): batched queries per cluster, date-range filters, updates. See
+[DESIGN.md §6](docs/DESIGN.md#6-what-id-do-next).
 
 ## Layout
 
