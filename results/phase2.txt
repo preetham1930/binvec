@@ -1,0 +1,80 @@
+   Compiling binvec v0.1.0 (/mnt/c/Users/preet/projects/binvec)
+    Finished `release` profile [optimized + debuginfo] target(s) in 10.73s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+CPU has AVX2: SIMD kernel in use
+               total        used        free      shared  buff/cache   available
+Mem:           11961         589       10911           3         664       11372
+Swap:           3072          99        2972
+
+######## A. convert to the FastScan layout (12:26)
+[convert] /home/preet_19/binvec-data/deep/idx-10M-4096-rot-unbiased.bin -> /home/preet_19/binvec-data/deep/idx-10M-4096-fastscan.bin (rot+unbiased+fastscan) in 0.3s
+[convert] /home/preet_19/binvec-data/deep/idx-100M-16384-rot-unbiased.bin -> /home/preet_19/binvec-data/deep/idx-100M-16384-fastscan.bin (rot+unbiased+fastscan) in 7.0s
+-rw-r--r-- 1 preet_19 preet_19 2409614904 Oct 30 12:26 /home/preet_19/binvec-data/deep/idx-100M-16384-fastscan.bin
+-rw-r--r-- 1 preet_19 preet_19 2406459440 Oct 30 04:21 /home/preet_19/binvec-data/deep/idx-100M-16384-rot-unbiased.bin
+-rw-r--r-- 1 preet_19 preet_19  242441400 Oct 30 12:26 /home/preet_19/binvec-data/deep/idx-10M-4096-fastscan.bin
+-rw-r--r-- 1 preet_19 preet_19  241642544 Oct 29 16:57 /home/preet_19/binvec-data/deep/idx-10M-4096-rot-unbiased.bin
+
+######## B. 10M in RAM: layout x collector (12:26)
+-- bytes + heap
+nprobe refine rerank recall@10   p50 ms   p99 ms  mean ms     QPS  |   cent   scan refine rerank |   majflt  swapin swapout
+    64   2000     50    0.9850   12.267   16.682   12.502    1450  |   0.10   2.03   0.14  10.23 |    52191       0       0
+    64   5000     50    0.9856    2.771    4.596    2.864    2839  |   0.06   2.48   0.21   0.11 |      146       0       0
+   128   2000     50    0.9944    3.803    6.764    3.943    1870  |   0.06   3.44   0.14   0.30 |      476       0       0
+   128   5000     50    0.9952    4.357    5.886    4.404    1501  |   0.07   4.06   0.25   0.02 |        9       0       0
+-- bytes + reservoir
+nprobe refine rerank recall@10   p50 ms   p99 ms  mean ms     QPS  |   cent   scan refine rerank |   majflt  swapin swapout
+    64   2000     50    0.9850    1.854    2.713    1.909    3136  |   0.05   1.65   0.12   0.09 |        0       0       0
+    64   5000     50    0.9856    2.035    2.962    2.085    3047  |   0.05   1.80   0.21   0.02 |        0       0       0
+   128   2000     50    0.9944    3.317    5.696    3.414    1777  |   0.07   3.17   0.15   0.02 |        0       0       0
+   128   5000     50    0.9952    3.544    4.821    3.604    1768  |   0.06   3.28   0.25   0.02 |        0       0       0
+-- fastscan + heap
+nprobe refine rerank recall@10   p50 ms   p99 ms  mean ms     QPS  |   cent   scan refine rerank |   majflt  swapin swapout
+    64   2000     50    0.9850    1.204    3.030    1.330    6172  |   0.05   0.93   0.12   0.22 |        2       0       0
+    64   5000     50    0.9856    1.716    2.429    1.711    4151  |   0.06   1.42   0.22   0.01 |        0       0       0
+   128   2000     50    0.9944    1.504    1.983    1.514    3724  |   0.06   1.30   0.14   0.01 |        0       0       0
+   128   5000     50    0.9952    2.217    3.013    2.226    2780  |   0.06   1.89   0.25   0.02 |        0       0       0
+-- fastscan + reservoir
+nprobe refine rerank recall@10   p50 ms   p99 ms  mean ms     QPS  |   cent   scan refine rerank |   majflt  swapin swapout
+    64   2000     50    0.9850    0.830    1.177    0.844    6112  |   0.05   0.58   0.12   0.08 |        0       0       0
+    64   5000     50    0.9856    1.001    1.273    1.007    4499  |   0.05   0.72   0.21   0.02 |        0       0       0
+   128   2000     50    0.9944    1.267    1.846    1.292    3815  |   0.06   1.07   0.14   0.02 |        0       0       0
+   128   5000     50    0.9952    1.468    1.923    1.483    3069  |   0.06   1.16   0.25   0.01 |        0       0       0
+
+######## C. 100M cold: old path vs new path, 3 runs each, alternating (12:28)
+nprobe refine rerank recall@10   p50 ms   p99 ms  mean ms     QPS  |   cent   scan refine rerank |   majflt  swapin swapout
+-- rep 1, nprobe 64 / refine 2000 / rerank 20: bytes+heap, then fastscan+reservoir
+    64   2000     20    0.9705   10.626   20.415   11.223     769  |   0.46   6.46   2.54   1.76 |        0       0       0
+    64   2000     20    0.9705    3.446    5.908    3.489    1911  |   0.41   1.83   0.63   0.62 |        0       0       0
+-- rep 1, nprobe 128 / refine 5000 / rerank 50: bytes+heap, then fastscan+reservoir
+   128   5000     50    0.9889   12.153   21.058   12.530     366  |   0.45   9.80   0.96   1.31 |        0       0       0
+   128   5000     50    0.9889    5.178    9.228    5.402    1037  |   0.39   3.01   0.90   1.10 |        0       0       0
+-- rep 2, nprobe 64 / refine 2000 / rerank 20: bytes+heap, then fastscan+reservoir
+    64   2000     20    0.9705    6.673   11.915    6.992     694  |   0.37   5.38   0.49   0.76 |        0       0       0
+    64   2000     20    0.9705    2.416    3.415    2.465    1962  |   0.28   1.40   0.22   0.56 |        0       0       0
+-- rep 2, nprobe 128 / refine 5000 / rerank 50: bytes+heap, then fastscan+reservoir
+   128   5000     50    0.9889   13.130   21.429   13.589     297  |   0.49  10.72   1.21   1.17 |        0       0       0
+   128   5000     50    0.9889    4.954    6.698    5.074     863  |   0.36   2.95   0.63   1.14 |        0       0       0
+-- rep 3, nprobe 64 / refine 2000 / rerank 20: bytes+heap, then fastscan+reservoir
+    64   2000     20    0.9705    6.629   10.580    6.905     571  |   0.37   5.55   0.20   0.78 |        0       0       0
+    64   2000     20    0.9705    3.410    5.432    3.533    1739  |   0.46   1.87   0.51   0.69 |        0       0       0
+-- rep 3, nprobe 128 / refine 5000 / rerank 50: bytes+heap, then fastscan+reservoir
+   128   5000     50    0.9889   14.023   21.861   14.575     288  |   0.49  11.81   1.02   1.25 |        0       0       0
+   128   5000     50    0.9889    5.797    9.106    5.974     844  |   0.45   3.39   0.93   1.21 |        0       0       0
+
+######## D. 100M cold grid, new path (12:31)
+nprobe refine rerank recall@10   p50 ms   p99 ms  mean ms     QPS  |   cent   scan refine rerank |   majflt  swapin swapout
+    64   2000     20    0.9704    3.256    5.068    3.371    1585  |   0.41   1.91   0.36   0.68 |        0       0       0
+    64   5000     50    0.9748    4.312    6.531    4.386    1040  |   0.44   2.05   0.72   1.17 |        0       0       0
+   128   2000     50    0.9880    5.916    9.770    6.143     849  |   0.57   3.50   0.79   1.28 |        0       0       0
+   128   5000     50    0.9905    6.768   10.335    6.915     776  |   0.60   3.91   1.19   1.21 |        0       0       0
+   256   5000     50    0.9960   19.409  115.856   27.872     342  |   0.65  17.64   6.14   3.45 |        0       0       0
+   256  10000     50    0.9965   11.670   17.632   11.875     419  |   0.61   6.70   2.21   2.36 |        0       0       0
+ nprobe    ceiling@10
+     64        0.9753
+    128        0.9910
+    256        0.9972
+               total        used        free      shared  buff/cache   available
+Mem:           11961         732        2645           3        8833       11229
+Swap:           3072          99        2972
+
+######## phase 2 done (12:33)

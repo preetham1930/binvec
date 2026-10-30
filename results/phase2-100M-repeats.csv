@@ -1,0 +1,13 @@
+label,n,nlist,nprobe,refine_k,rerank,recall10,p50_ms,p99_ms,mean_ms,qps,threads,ram_gb,t_centroids_ms,t_scan_ms,t_refine_ms,t_rerank_ms,major_faults,swap_in_pages,swap_out_pages
+"deep100M Preetham v0.5 bytes+heap rep1 rot+unbiased prefetch",100000000,16384,64,2000,20,0.9705,10.626,20.415,11.223,769,16,8.006,0.456,6.460,2.544,1.761,0,0,0
+"deep100M Preetham v0.5 fastscan+reservoir rep1 rot+unbiased+fastscan prefetch",100000000,16384,64,2000,20,0.9705,3.446,5.908,3.489,1911,16,8.010,0.406,1.832,0.631,0.618,0,0,0
+"deep100M Preetham v0.5 bytes+heap rep1 rot+unbiased prefetch",100000000,16384,128,5000,50,0.9889,12.153,21.058,12.530,366,16,8.006,0.454,9.804,0.957,1.312,0,0,0
+"deep100M Preetham v0.5 fastscan+reservoir rep1 rot+unbiased+fastscan prefetch",100000000,16384,128,5000,50,0.9889,5.178,9.228,5.402,1037,16,8.010,0.386,3.013,0.905,1.097,0,0,0
+"deep100M Preetham v0.5 bytes+heap rep2 rot+unbiased prefetch",100000000,16384,64,2000,20,0.9705,6.673,11.915,6.992,694,16,8.006,0.368,5.380,0.487,0.755,0,0,0
+"deep100M Preetham v0.5 fastscan+reservoir rep2 rot+unbiased+fastscan prefetch",100000000,16384,64,2000,20,0.9705,2.416,3.415,2.465,1962,16,8.010,0.281,1.404,0.224,0.555,0,0,0
+"deep100M Preetham v0.5 bytes+heap rep2 rot+unbiased prefetch",100000000,16384,128,5000,50,0.9889,13.130,21.429,13.589,297,16,8.006,0.486,10.722,1.212,1.167,0,0,0
+"deep100M Preetham v0.5 fastscan+reservoir rep2 rot+unbiased+fastscan prefetch",100000000,16384,128,5000,50,0.9889,4.954,6.698,5.074,863,16,8.010,0.358,2.946,0.631,1.137,0,0,0
+"deep100M Preetham v0.5 bytes+heap rep3 rot+unbiased prefetch",100000000,16384,64,2000,20,0.9705,6.629,10.580,6.905,571,16,8.006,0.371,5.554,0.196,0.783,0,0,0
+"deep100M Preetham v0.5 fastscan+reservoir rep3 rot+unbiased+fastscan prefetch",100000000,16384,64,2000,20,0.9705,3.410,5.432,3.533,1739,16,8.010,0.459,1.872,0.513,0.688,0,0,0
+"deep100M Preetham v0.5 bytes+heap rep3 rot+unbiased prefetch",100000000,16384,128,5000,50,0.9889,14.023,21.861,14.575,288,16,8.006,0.489,11.812,1.017,1.255,0,0,0
+"deep100M Preetham v0.5 fastscan+reservoir rep3 rot+unbiased+fastscan prefetch",100000000,16384,128,5000,50,0.9889,5.797,9.106,5.974,844,16,8.010,0.449,3.392,0.926,1.205,0,0,0

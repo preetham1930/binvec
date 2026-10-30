@@ -54,16 +54,54 @@ impl Refine {
         (lo, step)
     }
 
+    /// Ask the CPU to start loading a slot's code into cache (a hint; no effect on results).
+    /// At 100M the codes are 5.6 GB, so each candidate is a cache miss; issuing the load a few
+    /// candidates ahead overlaps the misses instead of paying them one after another.
+    #[inline]
+    pub fn prefetch(&self, slot: usize) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let h = self.d / 2;
+            if slot < self.n {
+                // SAFETY: prefetch is a hint and never faults; the address is in bounds anyway.
+                unsafe {
+                    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                    let p = self.codes.as_ptr().add(slot * h) as *const i8;
+                    _mm_prefetch(p, _MM_HINT_T0);
+                    _mm_prefetch(p.add(h - 1), _MM_HINT_T0);
+                }
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = slot;
+    }
+
     /// Estimated ||r − e||² for the vector at `slot`, where r = rotated query − its centroid.
     #[inline]
     pub fn dist(&self, slot: usize, r: &[f32]) -> f32 {
         let h = self.d / 2;
         let code = &self.codes[slot * h..(slot + 1) * h];
         let (lo, step) = (self.lo[slot], self.step[slot]);
-        let mut s = 0.0f32;
-        for (j, &b) in code.iter().enumerate() {
-            let a = r[2 * j] - (lo + step * (b & 15) as f32);
-            let c = r[2 * j + 1] - (lo + step * (b >> 4) as f32);
+        // Eight independent sums (one per dimension of an 8-dim chunk) instead of one: a single
+        // running sum makes every add wait for the previous one, and the compiler may not
+        // reorder float adds on its own. With eight lanes it can use one SIMD register.
+        let mut acc = [0f32; 8];
+        let chunks = code.chunks_exact(4);
+        let tail = chunks.remainder();
+        for (cc, rc) in chunks.zip(r.chunks_exact(8)) {
+            for t in 0..4 {
+                let b = cc[t];
+                let a = rc[2 * t] - (lo + step * (b & 15) as f32);
+                let c = rc[2 * t + 1] - (lo + step * (b >> 4) as f32);
+                acc[2 * t] += a * a;
+                acc[2 * t + 1] += c * c;
+            }
+        }
+        let mut s: f32 = acc.iter().sum();
+        let j0 = (h - tail.len()) * 2;
+        for (j, &b) in tail.iter().enumerate() {
+            let a = r[j0 + 2 * j] - (lo + step * (b & 15) as f32);
+            let c = r[j0 + 2 * j + 1] - (lo + step * (b >> 4) as f32);
             s += a * a + c * c;
         }
         s
@@ -182,6 +220,40 @@ impl Refine {
 mod tests {
     use super::*;
     use crate::rng::Rng;
+
+    #[test]
+    fn chunked_dist_matches_naive() {
+        for &d in &[96usize, 100, 6] {
+            let mut rng = crate::rng::Rng::new(d as u64);
+            let e: Vec<f32> = (0..d).map(|_| rng.normal()).collect();
+            let r: Vec<f32> = (0..d).map(|_| rng.normal()).collect();
+            let mut code = vec![0u8; d / 2];
+            let (lo, step) = Refine::encode(&e, &mut code);
+            let rf = Refine {
+                n: 1,
+                d,
+                codes: code.clone().into(),
+                lo: vec![lo].into(),
+                step: vec![step].into(),
+            };
+            let naive: f32 = (0..d)
+                .map(|j| {
+                    let q = if j % 2 == 0 {
+                        code[j / 2] & 15
+                    } else {
+                        code[j / 2] >> 4
+                    };
+                    let x = r[j] - (lo + step * q as f32);
+                    x * x
+                })
+                .sum();
+            let got = rf.dist(0, &r);
+            assert!(
+                (got - naive).abs() <= 1e-4 * naive.max(1.0),
+                "d={d}: {got} vs {naive}"
+            );
+        }
+    }
 
     #[test]
     fn four_bit_estimate_is_close() {

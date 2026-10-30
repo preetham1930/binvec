@@ -12,10 +12,10 @@
 //!
 //! ## Estimators (choose with `--estimator`)
 //! - `ls`       : scale = ||e'||₁ / d. The least-squares fit e' ≈ scale·s. Simple, but biased:
-//!                it shrinks the cross term, more for some vectors than others, which distorts
-//!                the ranking. This was v0.1.
+//!   it shrinks the cross term, more for some vectors than others, which distorts
+//!   the ranking. This was v0.1.
 //! - `unbiased` : scale = ||e||² / ||e'||₁. The RaBitQ estimator (Gao & Long, SIGMOD 2024).
-//!                Combined with a random rotation its error is unbiased and concentrated.
+//!   Combined with a random rotation its error is unbiased and concentrated.
 //!
 //! ## Why rotate?
 //! Real embeddings put very different amounts of variance in different dimensions. One sign
@@ -30,18 +30,20 @@
 
 use crate::buf::{map_file, Buf};
 use crate::dist::{dot, l2sq};
+use crate::fastscan;
 use crate::io::Fbin;
 use crate::kmeans;
 use crate::refine::Refine;
 use crate::rng::Rng;
-use crate::topk::{Hit, TopK};
+use crate::topk::{Collector, Hit, TopK};
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufWriter, Result, Write};
 use std::path::Path;
 use std::time::Instant;
 
-const MAGIC: &[u8; 8] = b"BINVEC02";
+const MAGIC: &[u8; 8] = b"BINVEC02"; // codes as d/8 bytes per vector (byte-LUT scan)
+const MAGIC_FS: &[u8; 8] = b"BINVEC03"; // codes in FastScan blocks of 32
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Estimator {
@@ -75,6 +77,10 @@ pub struct IvfIndex {
     pub codes: Buf<u8>,
     pub scale: Buf<f32>,
     pub rnorm: Buf<f32>,
+    /// FastScan layout (see `fastscan.rs`): list c's blocks are
+    /// fs_blocks[fs_offsets[c]·bb .. fs_offsets[c+1]·bb]. Empty when `codes` is used instead.
+    pub fs_offsets: Vec<u64>,
+    pub fs_blocks: Buf<u8>,
 }
 
 pub struct BuildParams {
@@ -100,6 +106,8 @@ pub struct SearchParams {
     pub rerank: usize,
     /// Start all rerank reads before computing any.
     pub prefetch: bool,
+    /// Collect scan candidates in a binary heap (v0.4) instead of the reservoir. For benchmarks.
+    pub heap: bool,
 }
 
 /// Time spent in each stage of one search, in seconds.
@@ -170,10 +178,42 @@ impl IvfIndex {
 
     pub fn variant(&self) -> String {
         format!(
-            "{}+{}",
+            "{}+{}{}",
             if self.rotate { "rot" } else { "norot" },
-            self.estimator.name()
+            self.estimator.name(),
+            if self.is_fastscan() { "+fastscan" } else { "" }
         )
+    }
+
+    pub fn is_fastscan(&self) -> bool {
+        !self.fs_offsets.is_empty()
+    }
+
+    /// Re-pack the 1-bit codes into the FastScan block layout (and drop the old layout).
+    pub fn to_fastscan(&mut self) {
+        if self.is_fastscan() {
+            return;
+        }
+        let cb = self.code_bytes();
+        let per_list: Vec<Vec<u8>> = (0..self.nlist)
+            .into_par_iter()
+            .map(|c| {
+                let (lo, hi) = (self.offsets[c] as usize, self.offsets[c + 1] as usize);
+                let mut out = Vec::new();
+                fastscan::pack(&self.codes[lo * cb..hi * cb], cb, &mut out);
+                out
+            })
+            .collect();
+        let bb = fastscan::block_bytes(2 * cb);
+        let mut fs_offsets = vec![0u64; self.nlist + 1];
+        let mut blocks = Vec::with_capacity(per_list.iter().map(|v| v.len()).sum());
+        for (c, v) in per_list.into_iter().enumerate() {
+            fs_offsets[c + 1] = fs_offsets[c] + (v.len() / bb) as u64;
+            blocks.extend_from_slice(&v);
+        }
+        self.fs_offsets = fs_offsets;
+        self.fs_blocks = blocks.into();
+        self.codes = Vec::new().into();
     }
 
     pub fn build(base: &Fbin, p: &BuildParams) -> Self {
@@ -325,6 +365,8 @@ impl IvfIndex {
             codes: codes.into(),
             scale: scale.into(),
             rnorm: rnorm.into(),
+            fs_offsets: Vec::new(),
+            fs_blocks: Vec::new().into(),
         };
         idx.print_balance();
         idx
@@ -358,6 +400,8 @@ impl IvfIndex {
             + self.offsets.len() * 8
             + self.ids.len() * 4
             + self.codes.len()
+            + self.fs_offsets.len() * 8
+            + self.fs_blocks.len()
             + self.scale.len() * 4
             + self.rnorm.len() * 4
     }
@@ -411,6 +455,7 @@ impl IvfIndex {
     /// 2. score every vector in them from its 1-bit code, keep the best `refine_k` (or `rerank`);
     /// 3. (optional) rescore those from the 4-bit `refine` codes in RAM, keep the best `rerank`;
     /// 4. (optional) rescore those exactly from the full vectors in `base` (on disk), keep `k`.
+    ///
     /// Pass `times` to get how long each stage took.
     pub fn search(
         &self,
@@ -448,9 +493,12 @@ impl IvfIndex {
         } else {
             k
         };
-        let mut cand = TopK::new(keep);
+        let mut cand = Collector::new(keep, p.heap);
         let mut r = vec![0f32; d];
-        let mut lut = vec![0f32; cb * 256];
+        let fast = self.is_fastscan();
+        let mut lut = vec![0f32; if fast { 0 } else { cb * 256 }];
+        let mut qlut = vec![0u8; if fast { 2 * cb * 16 } else { 0 }];
+        let mut sums: Vec<u16> = Vec::new();
         for &(_, c) in &cd {
             let c = c as usize;
             let cen = &self.centroids[c * d..(c + 1) * d];
@@ -458,9 +506,31 @@ impl IvfIndex {
                 r[j] = qr[j] - cen[j];
             }
             let rr = dot(&r, &r);
-            build_lut(&r, &mut lut);
-
             let (lo, hi) = (self.offsets[c] as usize, self.offsets[c + 1] as usize);
+
+            if fast {
+                // FastScan: integer scores for 32 vectors per SIMD step, then one pass to turn
+                // them into distance estimates.
+                let (delta, bias) = fastscan::build_qlut(&r, &mut qlut);
+                let bb = fastscan::block_bytes(2 * cb);
+                let (b0, b1) = (self.fs_offsets[c] as usize, self.fs_offsets[c + 1] as usize);
+                sums.resize((b1 - b0) * fastscan::BLOCK, 0);
+                fastscan::scan(&self.fs_blocks[b0 * bb..b1 * bb], 2 * cb, &qlut, &mut sums);
+                let mut thr = cand.threshold();
+                let (rn, sc) = (&self.rnorm[lo..hi], &self.scale[lo..hi]);
+                for (v, ((&sum, &rn), &sc)) in sums.iter().zip(rn).zip(sc).enumerate() {
+                    let slot = lo + v;
+                    let s = delta * sum as f32 + bias;
+                    let est = rr + rn - 2.0 * sc * s;
+                    if est < thr {
+                        cand.push(est, slot as u32);
+                        thr = cand.threshold();
+                    }
+                }
+                continue;
+            }
+
+            build_lut(&r, &mut lut);
             let codes = &self.codes[lo * cb..hi * cb];
             for (v, code) in codes.chunks_exact(cb).enumerate() {
                 let mut s = 0.0f32;
@@ -474,20 +544,41 @@ impl IvfIndex {
                 }
             }
         }
-        let mut cand = cand.into_sorted();
+        let mut cand = match (use_refine, refine) {
+            // The refine stage doesn't need distance order. Slot order instead makes its reads
+            // into the 5.6 GB refine array run forwards, list by list.
+            (true, Some(_)) => {
+                let mut v = cand.into_unsorted();
+                v.sort_unstable_by_key(|h| h.id);
+                v
+            }
+            _ => cand.into_sorted(),
+        };
         let t2 = Instant::now();
 
         // Stage 3: 4-bit refine in RAM.
         if let (true, Some(rf)) = (use_refine, refine) {
             let want = if p.rerank > 0 { p.rerank.max(k) } else { k };
             let mut better = TopK::new(want);
-            for h in &cand {
+            // Candidates are in slot order, so lists come one after another: find each list
+            // once by binary search and compute its query residual once.
+            let mut list_end = 0usize;
+            const AHEAD: usize = 8;
+            for h in cand.iter().take(AHEAD) {
+                rf.prefetch(h.id as usize);
+            }
+            for (i, h) in cand.iter().enumerate() {
+                if let Some(n) = cand.get(i + AHEAD) {
+                    rf.prefetch(n.id as usize);
+                }
                 let slot = h.id as usize;
-                // Which list is this slot in? offsets is sorted, so binary search.
-                let c = self.offsets.partition_point(|&o| o as usize <= slot) - 1;
-                let cen = &self.centroids[c * d..(c + 1) * d];
-                for j in 0..d {
-                    r[j] = qr[j] - cen[j];
+                if slot >= list_end {
+                    let c = self.offsets.partition_point(|&o| o as usize <= slot) - 1;
+                    list_end = self.offsets[c + 1] as usize;
+                    let cen = &self.centroids[c * d..(c + 1) * d];
+                    for j in 0..d {
+                        r[j] = qr[j] - cen[j];
+                    }
                 }
                 better.push(rf.dist(slot, &r), h.id);
             }
@@ -532,7 +623,7 @@ impl IvfIndex {
 
     pub fn save(&self, path: &Path) -> Result<()> {
         let mut w = BufWriter::with_capacity(1 << 22, File::create(path)?);
-        w.write_all(MAGIC)?;
+        w.write_all(if self.is_fastscan() { MAGIC_FS } else { MAGIC })?;
         let flags =
             (self.rotate as usize) | ((self.estimator == Estimator::Unbiased) as usize) << 1;
         for v in [self.d, self.nlist, self.n, flags] {
@@ -541,8 +632,15 @@ impl IvfIndex {
         write_pod(&mut w, &self.rot)?;
         write_pod(&mut w, &self.centroids)?;
         write_pod(&mut w, &self.offsets)?;
+        if self.is_fastscan() {
+            write_pod(&mut w, &self.fs_offsets)?;
+        }
         write_pod(&mut w, &self.ids[..])?;
-        write_pod(&mut w, &self.codes[..])?;
+        if self.is_fastscan() {
+            write_pod(&mut w, &self.fs_blocks[..])?;
+        } else {
+            write_pod(&mut w, &self.codes[..])?;
+        }
         write_pod(&mut w, &self.scale[..])?;
         write_pod(&mut w, &self.rnorm[..])?;
         w.flush()
@@ -557,9 +655,10 @@ impl IvfIndex {
 
     pub fn load_with(path: &Path, copy: bool) -> Result<Self> {
         let map = map_file(path, true)?;
-        if map.len() < 40 || &map[0..8] != MAGIC {
+        let fast = map.len() >= 8 && &map[0..8] == MAGIC_FS;
+        if map.len() < 40 || !(fast || &map[0..8] == MAGIC) {
             return Err(std::io::Error::other(
-                "not a binvec v0.2 index file (rebuild it with `binvec build`)",
+                "not a binvec v0.2/v0.3 index file (rebuild it with `binvec build`)",
             ));
         }
         let word =
@@ -574,26 +673,44 @@ impl IvfIndex {
         off += nlist * d * 4;
         let offsets: Buf<u64> = Buf::copied(&map, off, nlist + 1);
         off += (nlist + 1) * 8;
+        let fs_offsets: Vec<u64> = if fast {
+            let v = Buf::<u64>::copied(&map, off, nlist + 1).to_vec();
+            off += (nlist + 1) * 8;
+            v
+        } else {
+            Vec::new()
+        };
+        // Bytes of the code section: FastScan blocks, or plain codes.
+        let code_len = if fast {
+            fs_offsets[nlist] as usize * fastscan::block_bytes(2 * cb)
+        } else {
+            n * cb
+        };
         let big =
             |off: usize, len: usize, size: usize| -> (usize, usize) { (off, off + len * size) };
         let (o_ids, next) = big(off, n, 4);
-        let (o_codes, next) = big(next, n * cb, 1);
+        let (o_codes, next) = big(next, code_len, 1);
         let (o_scale, next) = big(next, n, 4);
         let (o_rnorm, _) = big(next, n, 4);
         let (ids, codes, scale, rnorm): (Buf<u32>, Buf<u8>, Buf<f32>, Buf<f32>) = if copy {
             (
                 Buf::copied(&map, o_ids, n),
-                Buf::copied(&map, o_codes, n * cb),
+                Buf::copied(&map, o_codes, code_len),
                 Buf::copied(&map, o_scale, n),
                 Buf::copied(&map, o_rnorm, n),
             )
         } else {
             (
                 Buf::mapped(&map, o_ids, n),
-                Buf::mapped(&map, o_codes, n * cb),
+                Buf::mapped(&map, o_codes, code_len),
                 Buf::mapped(&map, o_scale, n),
                 Buf::mapped(&map, o_rnorm, n),
             )
+        };
+        let (plain, fs_blocks): (Buf<u8>, Buf<u8>) = if fast {
+            (Vec::new().into(), codes)
+        } else {
+            (codes, Vec::new().into())
         };
         let centroids = centroids.to_vec();
         let cnorms = kmeans::norms(&centroids, d);
@@ -612,9 +729,11 @@ impl IvfIndex {
             cnorms,
             offsets: offsets.to_vec(),
             ids,
-            codes,
+            codes: plain,
             scale,
             rnorm,
+            fs_offsets,
+            fs_blocks,
         })
     }
 }

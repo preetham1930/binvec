@@ -68,9 +68,140 @@ impl TopK {
     }
 }
 
+/// Keep roughly the k smallest (distance, id) pairs, for large k.
+///
+/// A heap pays O(log k) and an unpredictable branch on every accepted candidate; with k in the
+/// thousands, that cost showed up in the scan stage once the SIMD kernel made scoring cheap.
+/// A reservoir just appends candidates below the current threshold into a buffer of 2k, and when
+/// it fills, keeps the best k with one `select_nth_unstable` (O(k)) and tightens the threshold.
+/// Amortised O(1) per accepted candidate. (The same idea as FAISS's reservoir collectors.)
+pub struct Reservoir {
+    k: usize,
+    cap: usize,
+    thr: f32,
+    buf: Vec<Hit>,
+}
+
+impl Reservoir {
+    pub fn new(k: usize) -> Self {
+        let cap = (2 * k).max(64);
+        Reservoir {
+            k,
+            cap,
+            thr: f32::INFINITY,
+            buf: Vec::with_capacity(cap),
+        }
+    }
+
+    /// Candidates at or above this can be skipped.
+    #[inline]
+    pub fn threshold(&self) -> f32 {
+        self.thr
+    }
+
+    #[inline]
+    pub fn push(&mut self, dist: f32, id: u32) {
+        if dist < self.thr {
+            self.buf.push(Hit { dist, id });
+            if self.buf.len() == self.cap {
+                self.shrink();
+            }
+        }
+    }
+
+    fn shrink(&mut self) {
+        if self.buf.len() > self.k {
+            self.buf.select_nth_unstable_by(self.k - 1, |a, b| a.cmp(b));
+            self.buf.truncate(self.k);
+            // After the select, buf[k-1] is the k-th smallest and everything before it is ≤ it.
+            self.thr = self.buf[self.k - 1].dist;
+        }
+    }
+
+    /// The k best, in no particular order.
+    pub fn into_unsorted(mut self) -> Vec<Hit> {
+        self.shrink();
+        self.buf
+    }
+
+    /// The k best, nearest first.
+    pub fn into_sorted(mut self) -> Vec<Hit> {
+        self.shrink();
+        self.buf.sort_unstable();
+        self.buf.truncate(self.k);
+        self.buf
+    }
+}
+
+/// Either collector, chosen at run time (the heap is kept for the before/after benchmark).
+pub enum Collector {
+    Heap(TopK),
+    Reservoir(Reservoir),
+}
+
+impl Collector {
+    pub fn new(k: usize, heap: bool) -> Self {
+        if heap {
+            Collector::Heap(TopK::new(k))
+        } else {
+            Collector::Reservoir(Reservoir::new(k))
+        }
+    }
+
+    #[inline]
+    pub fn threshold(&self) -> f32 {
+        match self {
+            Collector::Heap(h) => h.threshold(),
+            Collector::Reservoir(r) => r.threshold(),
+        }
+    }
+
+    #[inline]
+    pub fn push(&mut self, dist: f32, id: u32) {
+        match self {
+            Collector::Heap(h) => h.push(dist, id),
+            Collector::Reservoir(r) => r.push(dist, id),
+        }
+    }
+
+    pub fn into_unsorted(self) -> Vec<Hit> {
+        match self {
+            Collector::Heap(h) => h.into_sorted(),
+            Collector::Reservoir(r) => r.into_unsorted(),
+        }
+    }
+
+    pub fn into_sorted(self) -> Vec<Hit> {
+        match self {
+            Collector::Heap(h) => h.into_sorted(),
+            Collector::Reservoir(r) => r.into_sorted(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reservoir_matches_heap() {
+        let mut rng = crate::rng::Rng::new(11);
+        for &k in &[1usize, 10, 100, 1000] {
+            let mut h = TopK::new(k);
+            let mut r = Reservoir::new(k);
+            for id in 0..20_000u32 {
+                let d = rng.unit();
+                h.push(d, id);
+                r.push(d, id);
+            }
+            let a: Vec<u32> = h.into_sorted().iter().map(|x| x.id).collect();
+            let mut u: Vec<u32> = r.into_unsorted().iter().map(|x| x.id).collect();
+            let mut b = a.clone();
+            b.sort_unstable();
+            u.sort_unstable();
+            assert_eq!(b, u, "k = {k} (unsorted set)");
+        }
+    }
 
     #[test]
     fn keeps_smallest() {

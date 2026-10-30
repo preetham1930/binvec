@@ -7,6 +7,7 @@
 
 pub mod buf;
 pub mod dist;
+pub mod fastscan;
 pub mod io;
 pub mod ivf;
 pub mod kmeans;

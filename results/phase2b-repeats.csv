@@ -1,0 +1,12 @@
+label,n,nlist,nprobe,refine_k,rerank,recall10,p50_ms,p99_ms,mean_ms,qps,threads,ram_gb,t_centroids_ms,t_scan_ms,t_refine_ms,t_rerank_ms,major_faults,swap_in_pages,swap_out_pages
+"deep100M Preetham v0.5 cold rep1 rot+unbiased+fastscan prefetch",100000000,16384,128,5000,50,0.9889,5.350,7.784,5.466,1063,16,8.010,0.354,2.900,1.097,1.113,0,0,0
+"deep100M Preetham v0.5 cold rep1 rot+unbiased+fastscan prefetch",100000000,16384,256,5000,50,0.9946,6.328,10.573,6.557,689,16,8.010,0.419,4.549,0.414,1.174,0,0,0
+"deep100M Preetham v0.5 cold rep1 rot+unbiased+fastscan prefetch",100000000,16384,256,10000,50,0.9951,6.826,10.602,7.072,626,16,8.010,0.476,4.808,0.669,1.118,0,0,0
+"deep100M Preetham v0.5 cold rep2 rot+unbiased+fastscan prefetch",100000000,16384,128,5000,50,0.9889,4.923,7.515,5.056,980,16,8.010,0.369,2.558,1.009,1.118,0,0,0
+"deep100M Preetham v0.5 cold rep2 rot+unbiased+fastscan prefetch",100000000,16384,256,5000,50,0.9946,6.968,9.576,7.071,682,16,8.010,0.491,4.620,0.793,1.166,0,0,0
+"deep100M Preetham v0.5 cold rep2 rot+unbiased+fastscan prefetch",100000000,16384,256,10000,50,0.9951,7.260,10.061,7.403,603,16,8.010,0.468,4.854,0.966,1.113,0,0,0
+"deep100M Preetham v0.5 cold rep3 rot+unbiased+fastscan prefetch",100000000,16384,128,5000,50,0.9889,4.351,5.865,4.450,1007,16,8.010,0.341,2.653,0.480,0.975,0,0,0
+"deep100M Preetham v0.5 cold rep3 rot+unbiased+fastscan prefetch",100000000,16384,256,5000,50,0.9946,6.949,9.945,7.117,654,16,8.010,0.475,4.751,0.705,1.184,0,0,0
+"deep100M Preetham v0.5 cold rep3 rot+unbiased+fastscan prefetch",100000000,16384,256,10000,50,0.9951,8.207,11.846,8.401,567,16,8.010,0.486,5.383,1.258,1.272,0,0,0
+"deep100M Preetham v0.5 cold explore rot+unbiased+fastscan prefetch",100000000,16384,512,10000,50,0.9970,12.697,18.989,12.919,346,16,8.010,0.553,9.741,1.439,1.184,0,0,0
+"deep100M Preetham v0.5 cold explore rot+unbiased+fastscan prefetch",100000000,16384,512,20000,100,0.9971,15.698,30.943,17.097,271,16,8.010,0.608,11.158,3.385,1.943,0,0,0

@@ -1,0 +1,17 @@
+label,n,nlist,nprobe,refine_k,rerank,recall10,p50_ms,p99_ms,mean_ms,qps,threads,ram_gb,t_centroids_ms,t_scan_ms,t_refine_ms,t_rerank_ms,major_faults,swap_in_pages,swap_out_pages
+"deep10M Preetham v0.5 bytes+heap rot+unbiased",10000000,4096,64,2000,50,0.9850,12.267,16.682,12.502,1450,16,0.802,0.097,2.028,0.142,10.233,52191,0,0
+"deep10M Preetham v0.5 bytes+heap rot+unbiased",10000000,4096,64,5000,50,0.9856,2.771,4.596,2.864,2839,16,0.802,0.058,2.479,0.213,0.114,146,0,0
+"deep10M Preetham v0.5 bytes+heap rot+unbiased",10000000,4096,128,2000,50,0.9944,3.803,6.764,3.943,1870,16,0.802,0.065,3.441,0.140,0.297,476,0,0
+"deep10M Preetham v0.5 bytes+heap rot+unbiased",10000000,4096,128,5000,50,0.9952,4.357,5.886,4.404,1501,16,0.802,0.066,4.064,0.251,0.024,9,0,0
+"deep10M Preetham v0.5 bytes+reservoir rot+unbiased",10000000,4096,64,2000,50,0.9850,1.854,2.713,1.909,3136,16,0.802,0.052,1.648,0.121,0.087,0,0,0
+"deep10M Preetham v0.5 bytes+reservoir rot+unbiased",10000000,4096,64,5000,50,0.9856,2.035,2.962,2.085,3047,16,0.802,0.051,1.804,0.215,0.015,0,0,0
+"deep10M Preetham v0.5 bytes+reservoir rot+unbiased",10000000,4096,128,2000,50,0.9944,3.317,5.696,3.414,1777,16,0.802,0.067,3.175,0.149,0.022,0,0,0
+"deep10M Preetham v0.5 bytes+reservoir rot+unbiased",10000000,4096,128,5000,50,0.9952,3.544,4.821,3.604,1768,16,0.802,0.060,3.276,0.251,0.016,0,0,0
+"deep10M Preetham v0.5 fastscan+heap rot+unbiased+fastscan",10000000,4096,64,2000,50,0.9850,1.204,3.030,1.330,6172,16,0.802,0.055,0.931,0.121,0.222,2,0,0
+"deep10M Preetham v0.5 fastscan+heap rot+unbiased+fastscan",10000000,4096,64,5000,50,0.9856,1.716,2.429,1.711,4151,16,0.802,0.057,1.423,0.216,0.014,0,0,0
+"deep10M Preetham v0.5 fastscan+heap rot+unbiased+fastscan",10000000,4096,128,2000,50,0.9944,1.504,1.983,1.514,3724,16,0.802,0.058,1.303,0.138,0.015,0,0,0
+"deep10M Preetham v0.5 fastscan+heap rot+unbiased+fastscan",10000000,4096,128,5000,50,0.9952,2.217,3.013,2.226,2780,16,0.802,0.061,1.894,0.255,0.015,0,0,0
+"deep10M Preetham v0.5 fastscan+reservoir rot+unbiased+fastscan",10000000,4096,64,2000,50,0.9850,0.830,1.177,0.844,6112,16,0.802,0.054,0.584,0.122,0.084,0,0,0
+"deep10M Preetham v0.5 fastscan+reservoir rot+unbiased+fastscan",10000000,4096,64,5000,50,0.9856,1.001,1.273,1.007,4499,16,0.802,0.055,0.719,0.214,0.018,0,0,0
+"deep10M Preetham v0.5 fastscan+reservoir rot+unbiased+fastscan",10000000,4096,128,2000,50,0.9944,1.267,1.846,1.292,3815,16,0.802,0.062,1.069,0.144,0.016,0,0,0
+"deep10M Preetham v0.5 fastscan+reservoir rot+unbiased+fastscan",10000000,4096,128,5000,50,0.9952,1.468,1.923,1.483,3069,16,0.802,0.055,1.163,0.250,0.014,0,0,0

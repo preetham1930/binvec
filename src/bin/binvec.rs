@@ -85,6 +85,16 @@ enum Cmd {
         /// only the centroids in the N nearest groups (much faster at large nlist; try 8).
         #[arg(long, default_value_t = 0)]
         assign_probe: usize,
+        /// Code layout: "fastscan" (SIMD, default) or "bytes" (v0.4 byte-LUT scan)
+        #[arg(long, default_value = "fastscan")]
+        layout: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Convert an index to the FastScan layout (no rebuild, no base vectors needed)
+    Convert {
+        #[arg(long)]
+        index: PathBuf,
         #[arg(long)]
         out: PathBuf,
     },
@@ -145,6 +155,10 @@ enum Cmd {
         /// (the v0.3 behaviour; doubles peak memory while loading)
         #[arg(long)]
         copy_load: bool,
+        /// Collect scan candidates in a binary heap (the v0.4 behaviour) instead of the
+        /// reservoir. For before/after comparisons.
+        #[arg(long)]
+        heap: bool,
         /// Queries timed one by one on a single thread for latency percentiles
         #[arg(long, default_value_t = 2000)]
         nq_latency: usize,
@@ -340,11 +354,12 @@ fn main() -> std::io::Result<()> {
             no_rotate,
             estimator,
             assign_probe,
+            layout,
             out,
         } => {
             let base = Fbin::open(&base, limit)?;
             let t = Instant::now();
-            let idx = IvfIndex::build(
+            let mut idx = IvfIndex::build(
                 &base,
                 &BuildParams {
                     nlist,
@@ -360,12 +375,31 @@ fn main() -> std::io::Result<()> {
                     assign_probe,
                 },
             );
+            match layout.as_str() {
+                "fastscan" => idx.to_fastscan(),
+                "bytes" => {}
+                other => panic!("unknown --layout {other} (use fastscan or bytes)"),
+            }
             eprintln!(
                 "[build] total {:.1}s, saving to {}",
                 t.elapsed().as_secs_f64(),
                 out.display()
             );
             idx.save(&out)?;
+        }
+
+        Cmd::Convert { index, out } => {
+            let t = Instant::now();
+            let mut idx = IvfIndex::load(&index)?;
+            idx.to_fastscan();
+            idx.save(&out)?;
+            eprintln!(
+                "[convert] {} -> {} ({}) in {:.1}s",
+                index.display(),
+                out.display(),
+                idx.variant(),
+                t.elapsed().as_secs_f64()
+            );
         }
 
         Cmd::Refine {
@@ -424,6 +458,7 @@ fn main() -> std::io::Result<()> {
             refine,
             refine_k,
             copy_load,
+            heap,
             nq_latency,
             csv,
             label,
@@ -516,6 +551,7 @@ fn main() -> std::io::Result<()> {
                             refine_k: rk,
                             rerank: rr,
                             prefetch,
+                            heap,
                         };
                         // Warm-up uses queries the timed pass never sees (from the end of the file).
                         for i in (0..qs.n).rev().take(warmup.min(qs.n.saturating_sub(nl))) {

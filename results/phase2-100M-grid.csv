@@ -1,0 +1,7 @@
+label,n,nlist,nprobe,refine_k,rerank,recall10,p50_ms,p99_ms,mean_ms,qps,threads,ram_gb,t_centroids_ms,t_scan_ms,t_refine_ms,t_rerank_ms,major_faults,swap_in_pages,swap_out_pages
+"deep100M Preetham v0.5 fastscan+reservoir cold rot+unbiased+fastscan prefetch",100000000,16384,64,2000,20,0.9704,3.256,5.068,3.371,1585,16,8.010,0.413,1.914,0.363,0.680,0,0,0
+"deep100M Preetham v0.5 fastscan+reservoir cold rot+unbiased+fastscan prefetch",100000000,16384,64,5000,50,0.9748,4.312,6.531,4.386,1040,16,8.010,0.439,2.051,0.720,1.173,0,0,0
+"deep100M Preetham v0.5 fastscan+reservoir cold rot+unbiased+fastscan prefetch",100000000,16384,128,2000,50,0.9880,5.916,9.770,6.143,849,16,8.010,0.571,3.501,0.788,1.280,0,0,0
+"deep100M Preetham v0.5 fastscan+reservoir cold rot+unbiased+fastscan prefetch",100000000,16384,128,5000,50,0.9905,6.768,10.335,6.915,776,16,8.010,0.597,3.914,1.193,1.209,0,0,0
+"deep100M Preetham v0.5 fastscan+reservoir cold rot+unbiased+fastscan prefetch",100000000,16384,256,5000,50,0.9960,19.409,115.856,27.872,342,16,8.010,0.645,17.636,6.141,3.447,0,0,0
+"deep100M Preetham v0.5 fastscan+reservoir cold rot+unbiased+fastscan prefetch",100000000,16384,256,10000,50,0.9965,11.670,17.632,11.875,419,16,8.010,0.613,6.696,2.207,2.356,0,0,0

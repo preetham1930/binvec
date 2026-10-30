@@ -32,7 +32,7 @@ impl<T: Pod> Buf<T> {
             "file is shorter than its header says"
         );
         let ptr = map[off..].as_ptr();
-        if ptr as usize % std::mem::align_of::<T>() == 0 {
+        if (ptr as usize).is_multiple_of(std::mem::align_of::<T>()) {
             Buf::Mapped {
                 map: Arc::clone(map),
                 off,
