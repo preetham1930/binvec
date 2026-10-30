@@ -4,10 +4,12 @@
 //!   binvec verify  — brute-force a few queries and compare with the published ground truth
 //!   binvec build   — build an index from an .fbin file
 //!   binvec bench   — measure recall@10, latency and throughput for several settings
+//!   binvec labels / filter-gt / fbench — filtered search: labels, exact ground truth, benchmark
 
 use binvec::dist::l2sq;
+use binvec::filter::{self, Labels, TIERS};
 use binvec::io::{write_fbin, write_gt, Fbin, GroundTruth};
-use binvec::ivf::{BuildParams, Estimator, IvfIndex, SearchParams, StageTimes};
+use binvec::ivf::{BuildParams, Estimator, Filter, FilterMode, IvfIndex, SearchParams, StageTimes};
 use binvec::refine::Refine;
 use binvec::rng::Rng;
 use binvec::topk::{Hit, TopK};
@@ -179,6 +181,87 @@ enum Cmd {
         #[arg(long, default_value_t = 200)]
         warmup: usize,
     },
+    /// Make one label per vector with planted frequencies (50%, 10%, 1%, 0.1%, 0.01% + background)
+    Labels {
+        #[arg(long)]
+        base: PathBuf,
+        #[arg(long)]
+        limit: Option<usize>,
+        /// uniform (independent of position) or correlated (each label is a slab of space)
+        #[arg(long, default_value = "uniform")]
+        kind: String,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Exact filtered ground truth: for each of the first --nq queries and each planted label,
+    /// the true nearest neighbours among vectors with that label. One pass over the base file.
+    /// Row r of the output is label r / nq, query r % nq.
+    FilterGt {
+        #[arg(long)]
+        base: PathBuf,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        queries: PathBuf,
+        #[arg(long)]
+        labels: PathBuf,
+        #[arg(long, default_value_t = 1000)]
+        nq: usize,
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Benchmark filtered search, per planted label (selectivity)
+    Fbench {
+        #[arg(long)]
+        index: PathBuf,
+        #[arg(long)]
+        base: PathBuf,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        refine: PathBuf,
+        #[arg(long)]
+        queries: PathBuf,
+        #[arg(long)]
+        labels: PathBuf,
+        /// Filtered ground truth from `filter-gt`
+        #[arg(long)]
+        gt: PathBuf,
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        /// Comma-separated strategies: auto, scan, postings, post
+        #[arg(long, default_value = "post,scan,postings,auto")]
+        mode: String,
+        #[arg(long, default_value = "128")]
+        nprobe: String,
+        #[arg(long, default_value = "5000")]
+        refine_k: String,
+        #[arg(long, default_value = "50")]
+        rerank: String,
+        /// Comma-separated: matching vectors the in-scan strategy covers before it stops
+        #[arg(long, default_value = "20000")]
+        budget: String,
+        /// Cost of one 4-bit distance in units of one 1-bit FastScan score (planner constant)
+        #[arg(long, default_value_t = 30.0)]
+        postings_cost: f64,
+        /// Skip forced `postings` runs on labels with more matches than this (they score every
+        /// match per query: impractical, and `auto` never picks them)
+        #[arg(long, default_value_t = usize::MAX)]
+        skip_postings_above: usize,
+        #[arg(long)]
+        prefetch: bool,
+        /// Queries per label timed one by one on a single thread
+        #[arg(long, default_value_t = 300)]
+        nq_latency: usize,
+        #[arg(long, default_value = "results/filtered.csv")]
+        csv: PathBuf,
+        #[arg(long, default_value = "")]
+        label: String,
+    },
 }
 
 fn parse_list(s: &str) -> Vec<usize> {
@@ -229,6 +312,52 @@ fn exact_topk_many(base: &[f32], d: usize, queries: &[f32], k: usize) -> Vec<Vec
                     .collect()
             },
         )
+}
+
+/// Exact filtered top-k in one pass over `base`: row t·nq + i is query i among vectors with
+/// label t. Each base vector is compared only with the queries filtered on its own label, so
+/// the work is Σ selectivity × N × nq.
+fn exact_filtered_topk(
+    base: &[f32],
+    d: usize,
+    queries: &[f32],
+    labels: &[u16],
+    k: usize,
+) -> Vec<Vec<Hit>> {
+    const BLOCK: usize = 1 << 16;
+    let nq = queries.len() / d;
+    let rows = TIERS.len() * nq;
+    let fresh = || (0..rows).map(|_| TopK::new(k)).collect::<Vec<_>>();
+    base.par_chunks(BLOCK * d)
+        .enumerate()
+        .fold(fresh, |mut acc, (bi, blk)| {
+            for (i, x) in blk.chunks_exact(d).enumerate() {
+                let id = bi * BLOCK + i;
+                let t = labels[id] as usize;
+                if t >= TIERS.len() {
+                    continue;
+                }
+                let row = &mut acc[t * nq..(t + 1) * nq];
+                for (q, top) in queries.chunks_exact(d).zip(row.iter_mut()) {
+                    let dist = l2sq(q, x);
+                    if dist < top.threshold() {
+                        top.push(dist, id as u32);
+                    }
+                }
+            }
+            acc
+        })
+        .reduce(fresh, |mut a, b| {
+            for (x, y) in a.iter_mut().zip(b) {
+                for h in y.into_sorted() {
+                    x.push(h.dist, h.id);
+                }
+            }
+            a
+        })
+        .into_iter()
+        .map(|t| t.into_sorted())
+        .collect()
 }
 
 fn recall_at(found: &[u32], truth: &[u32], k: usize) -> f64 {
@@ -609,6 +738,283 @@ fn main() -> std::io::Result<()> {
                 }
             }
             eprintln!("[bench] results appended to {}", csv.display());
+        }
+        Cmd::Labels {
+            base,
+            limit,
+            kind,
+            seed,
+            out,
+        } => {
+            let t = Instant::now();
+            let base = Fbin::open(&base, limit)?;
+            let labels = match kind.as_str() {
+                "uniform" => filter::uniform_labels(base.n, seed),
+                "correlated" => filter::correlated_labels(&base, seed),
+                _ => panic!("--kind must be uniform or correlated"),
+            };
+            filter::write_labels(&out, &labels)?;
+            let mut counts = [0usize; TIERS.len()];
+            for &l in &labels {
+                if (l as usize) < TIERS.len() {
+                    counts[l as usize] += 1;
+                }
+            }
+            for (t, c) in counts.iter().enumerate() {
+                eprintln!(
+                    "[labels] label {t}: {c} vectors ({:.4}%, planted {}%)",
+                    100.0 * *c as f64 / base.n as f64,
+                    100.0 * TIERS[t]
+                );
+            }
+            eprintln!(
+                "[labels] {kind}, {} vectors -> {} in {:.1}s",
+                base.n,
+                out.display(),
+                t.elapsed().as_secs_f64()
+            );
+        }
+        Cmd::FilterGt {
+            base,
+            limit,
+            queries,
+            labels,
+            nq,
+            k,
+            out,
+        } => {
+            let t = Instant::now();
+            let base = Fbin::open(&base, limit)?;
+            base.advise_sequential();
+            let qs = Fbin::open(&queries, None)?;
+            let nq = nq.min(qs.n);
+            let labels = filter::read_labels(&labels)?;
+            assert_eq!(labels.len(), base.n, "labels file does not match base");
+            let res = exact_filtered_topk(base.data(), base.d, &qs.data()[..nq * qs.d], &labels, k);
+            let rows = res.len();
+            let mut ids = vec![0u32; rows * k];
+            let mut dists = vec![f32::INFINITY; rows * k];
+            for (r, hits) in res.iter().enumerate() {
+                for (j, h) in hits.iter().enumerate() {
+                    ids[r * k + j] = h.id;
+                    dists[r * k + j] = h.dist;
+                }
+            }
+            write_gt(&out, rows, k, &ids, &dists)?;
+            eprintln!(
+                "[filter-gt] {} labels x {nq} queries, k={k}, over {} vectors -> {} in {:.1}s",
+                TIERS.len(),
+                base.n,
+                out.display(),
+                t.elapsed().as_secs_f64()
+            );
+        }
+        Cmd::Fbench {
+            index,
+            base,
+            limit,
+            refine,
+            queries,
+            labels,
+            gt,
+            k,
+            mode,
+            nprobe,
+            refine_k,
+            rerank,
+            budget,
+            postings_cost,
+            skip_postings_above,
+            prefetch,
+            nq_latency,
+            csv,
+            label,
+        } => {
+            let idx = IvfIndex::load(&index)?;
+            let rf = Refine::load(&refine)?;
+            assert_eq!(rf.n, idx.n, "refine file does not match index");
+            let base = Fbin::open(&base, limit)?;
+            assert_eq!(base.n, idx.n, "base vector count does not match index");
+            let qs = Fbin::open(&queries, None)?;
+            let gt = GroundTruth::read(&gt)?;
+            let t = Instant::now();
+            let lab = {
+                let by_id = filter::read_labels(&labels)?;
+                Labels::build(&idx, &by_id)
+            };
+            // List of each id, for the ceiling; u16 halves its RAM (400 -> 200 MB at 100M).
+            assert!(idx.nlist <= 1 << 16);
+            let list_of: Vec<u16> = idx.list_of_ids().into_iter().map(|c| c as u16).collect();
+            eprintln!(
+                "[fbench] label structures built in {:.1}s ({:.2} GB)",
+                t.elapsed().as_secs_f64(),
+                lab.ram_bytes() as f64 / 1e9
+            );
+            let nqf = gt.nq / TIERS.len();
+            let nl = nq_latency.min(nqf);
+            let modes: Vec<FilterMode> = mode
+                .split(',')
+                .map(|m| FilterMode::parse(m.trim()).expect("unknown --mode"))
+                .collect();
+
+            const HEADER: &str = "label,n,nlist,mode,selectivity,matches,nprobe,refine_k,rerank,budget,recall10,ceiling10,p50_ms,p99_ms,mean_ms,qps,share_postings,mean_lists,mean_scored,t_plan_ms,t_scan_ms,t_refine_ms,t_rerank_ms,major_faults,swap_in_pages,swap_out_pages";
+            if let Some(dir) = csv.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let new_file = !csv.exists();
+            if !new_file {
+                let first = std::fs::read_to_string(&csv)?
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                if first != HEADER {
+                    return Err(std::io::Error::other(format!(
+                        "{} has an older column layout; pass a new --csv file name",
+                        csv.display()
+                    )));
+                }
+            }
+            let mut out = OpenOptions::new().create(true).append(true).open(&csv)?;
+            if new_file {
+                writeln!(out, "{HEADER}")?;
+            }
+            println!(
+                "{:>8} {:>8} {:>8} {:>6} {:>6} {:>6} {:>6} {:>9} {:>8} {:>8} {:>8} {:>7} {:>6} {:>6} {:>9} | {:>6} {:>6} {:>6} {:>6} | {:>7} {:>6} {:>6}",
+                "mode", "select%", "matches", "nprobe", "refine", "rerank", "budget", "recall@10",
+                "ceiling", "p50 ms", "p99 ms", "QPS", "%post", "lists", "scored", "plan", "scan",
+                "refine", "rerank", "majflt", "swpin", "swpout"
+            );
+            for &m in &modes {
+                for &np in &parse_list(&nprobe) {
+                    for &rk in &parse_list(&refine_k) {
+                        for &rr in &parse_list(&rerank) {
+                            for &bud in &parse_list(&budget) {
+                                let p = SearchParams {
+                                    k,
+                                    nprobe: np,
+                                    refine_k: rk,
+                                    rerank: rr,
+                                    prefetch,
+                                    heap: false,
+                                };
+                                for (t, &sel) in TIERS.iter().enumerate() {
+                                    if m == FilterMode::Postings
+                                        && lab.frequency(t as u16) > skip_postings_above
+                                    {
+                                        println!(
+                                            "{:>8} {:>8}  skipped: {} matches",
+                                            m.name(),
+                                            100.0 * sel,
+                                            lab.frequency(t as u16)
+                                        );
+                                        continue;
+                                    }
+                                    let f = Filter {
+                                        labels: &lab,
+                                        label: t as u16,
+                                        mode: m,
+                                        budget: bud,
+                                        postings_cost,
+                                    };
+                                    let run = |i: usize| {
+                                        idx.search_filtered(
+                                            qs.vector(i),
+                                            &p,
+                                            Some(&rf),
+                                            Some(&base),
+                                            None,
+                                            &f,
+                                        )
+                                    };
+                                    // Latency: one query at a time, one thread.
+                                    let mut st = StageTimes::default();
+                                    let (f0, (si0, so0)) = (major_faults(), swap_pages());
+                                    let mut lat: Vec<f64> = (0..nl)
+                                        .map(|i| {
+                                            let t0 = Instant::now();
+                                            std::hint::black_box(idx.search_filtered(
+                                                qs.vector(i),
+                                                &p,
+                                                Some(&rf),
+                                                Some(&base),
+                                                Some(&mut st),
+                                                &f,
+                                            ));
+                                            t0.elapsed().as_secs_f64() * 1e3
+                                        })
+                                        .collect();
+                                    let ms = |x: f64| x * 1e3 / nl as f64;
+                                    let (tc, ts, tr, tk) = (
+                                        ms(st.centroids),
+                                        ms(st.scan),
+                                        ms(st.refine),
+                                        ms(st.rerank),
+                                    );
+                                    let mean = lat.iter().sum::<f64>() / nl as f64;
+                                    lat.sort_by(|a, b| a.total_cmp(b));
+                                    // Recall, ceiling, throughput: all queries, all threads.
+                                    let t0 = Instant::now();
+                                    let per: Vec<(f64, f64, bool, usize, usize)> = (0..nqf)
+                                        .into_par_iter()
+                                        .map(|i| {
+                                            let (hits, st) = run(i);
+                                            let ids: Vec<u32> = hits.iter().map(|h| h.id).collect();
+                                            let truth = gt.row(t * nqf + i);
+                                            let truth = &truth[..k.min(truth.len())];
+                                            let rec = recall_at(&ids, truth, k);
+                                            let post = st.used == Some(FilterMode::Postings);
+                                            let ceil = if post {
+                                                1.0
+                                            } else {
+                                                let mut pr = st.probed.clone();
+                                                pr.sort_unstable();
+                                                truth
+                                                    .iter()
+                                                    .filter(|&&id| {
+                                                        pr.binary_search(
+                                                            &(list_of[id as usize] as u32),
+                                                        )
+                                                        .is_ok()
+                                                    })
+                                                    .count()
+                                                    as f64
+                                                    / truth.len() as f64
+                                            };
+                                            (rec, ceil, post, st.lists, st.scanned)
+                                        })
+                                        .collect();
+                                    let qps = nqf as f64 / t0.elapsed().as_secs_f64();
+                                    let (f1, (si1, so1)) = (major_faults(), swap_pages());
+                                    let (flt, sin, sout) = (f1 - f0, si1 - si0, so1 - so0);
+                                    let nf = nqf as f64;
+                                    let recall = per.iter().map(|x| x.0).sum::<f64>() / nf;
+                                    let ceiling = per.iter().map(|x| x.1).sum::<f64>() / nf;
+                                    let share = per.iter().filter(|x| x.2).count() as f64 / nf;
+                                    let lists = per.iter().map(|x| x.3).sum::<usize>() as f64 / nf;
+                                    let scored = per.iter().map(|x| x.4).sum::<usize>() as f64 / nf;
+                                    let (p50, p99) = (pct(&lat, 0.50), pct(&lat, 0.99));
+                                    let matches = lab.frequency(t as u16);
+                                    let mn = m.name();
+                                    let sp = 100.0 * sel;
+                                    println!(
+                                        "{mn:>8} {sp:>8} {matches:>8} {np:>6} {rk:>6} {rr:>6} {bud:>6} {recall:>9.4} {ceiling:>8.4} {p50:>8.3} {p99:>8.3} {qps:>7.0} {:>6.0} {lists:>6.0} {scored:>9.0} | {tc:>6.2} {ts:>6.2} {tr:>6.2} {tk:>6.2} | {flt:>7} {sin:>6} {sout:>6}",
+                                        100.0 * share
+                                    );
+                                    writeln!(
+                                        out,
+                                        "\"{label} {}\",{},{},{mn},{sel},{matches},{np},{rk},{rr},{bud},{recall:.4},{ceiling:.4},{p50:.3},{p99:.3},{mean:.3},{qps:.0},{share:.3},{lists:.1},{scored:.0},{tc:.3},{ts:.3},{tr:.3},{tk:.3},{flt},{sin},{sout}",
+                                        idx.variant(),
+                                        idx.n,
+                                        idx.nlist,
+                                    )?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            eprintln!("[fbench] results appended to {}", csv.display());
         }
     }
     Ok(())

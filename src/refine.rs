@@ -69,6 +69,9 @@ impl Refine {
                     let p = self.codes.as_ptr().add(slot * h) as *const i8;
                     _mm_prefetch(p, _MM_HINT_T0);
                     _mm_prefetch(p.add(h - 1), _MM_HINT_T0);
+                    // lo and step live in their own arrays: two more cache lines per vector.
+                    _mm_prefetch(self.lo.as_ptr().add(slot) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(self.step.as_ptr().add(slot) as *const i8, _MM_HINT_T0);
                 }
             }
         }

@@ -31,6 +31,7 @@
 use crate::buf::{map_file, Buf};
 use crate::dist::{dot, l2sq};
 use crate::fastscan;
+use crate::filter::Labels;
 use crate::io::Fbin;
 use crate::kmeans;
 use crate::refine::Refine;
@@ -126,6 +127,70 @@ impl StageTimes {
         self.refine += o.refine;
         self.rerank += o.rerank;
     }
+}
+
+/// How a filtered query is answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterMode {
+    /// Pick per query from the label's statistics (see `Filter`).
+    Auto,
+    /// In-scan filtering: skip non-matching vectors inside the 1-bit scan, and keep probing
+    /// lists until enough matching vectors have been covered.
+    Scan,
+    /// Inverted index: score exactly the vectors carrying the label, from their 4-bit codes.
+    Postings,
+    /// Baseline: search unfiltered, then drop non-matching results.
+    Post,
+}
+
+impl FilterMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            FilterMode::Auto => "auto",
+            FilterMode::Scan => "scan",
+            FilterMode::Postings => "postings",
+            FilterMode::Post => "post",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "auto" => FilterMode::Auto,
+            "scan" => FilterMode::Scan,
+            "postings" => FilterMode::Postings,
+            "post" => FilterMode::Post,
+            _ => return None,
+        })
+    }
+}
+
+/// A label filter for `search_filtered`.
+///
+/// The planner (`Auto`) compares two costs, both in "vectors touched":
+/// - in-scan: the total size of the lists the scan would walk (nearest first, lists without the
+///   label skipped) until `budget` matching vectors are covered;
+/// - inverted index: the number of vectors with the label × `postings_cost` (a 4-bit distance
+///   costs this many 1-bit FastScan scores).
+///
+/// Neither needs the query to be scored first: the per-list label counts answer both.
+pub struct Filter<'a> {
+    pub labels: &'a Labels,
+    pub label: u16,
+    pub mode: FilterMode,
+    /// Matching vectors the in-scan strategy should cover before it stops probing.
+    pub budget: usize,
+    pub postings_cost: f64,
+}
+
+/// What a filtered search did.
+#[derive(Clone, Debug, Default)]
+pub struct FilterStats {
+    pub used: Option<FilterMode>,
+    /// Lists scanned (0 for the inverted index).
+    pub lists: usize,
+    /// Vectors scored in the first stage (1-bit for scans, 4-bit for postings).
+    pub scanned: usize,
+    /// The lists scanned, for measuring the filtered ceiling.
+    pub probed: Vec<u32>,
 }
 
 /// Raw pointer we can share across threads; each thread writes disjoint slots.
@@ -465,11 +530,90 @@ impl IvfIndex {
         base: Option<&Fbin>,
         times: Option<&mut StageTimes>,
     ) -> Vec<Hit> {
+        self.search_impl(q, p, refine, base, times, None).0
+    }
+
+    /// Search among the vectors carrying one label. See `Filter` for the strategies.
+    pub fn search_filtered(
+        &self,
+        q: &[f32],
+        p: &SearchParams,
+        refine: Option<&Refine>,
+        base: Option<&Fbin>,
+        times: Option<&mut StageTimes>,
+        f: &Filter,
+    ) -> (Vec<Hit>, FilterStats) {
+        self.search_impl(q, p, refine, base, times, Some(f))
+    }
+
+    /// Lists to scan for a filtered query: walk lists nearest first, skipping lists with no
+    /// match, until at least `nprobe` lists have been passed *and* `budget` matching vectors
+    /// are covered. Centroids are ordered lazily, in growing chunks, since the walk may stop
+    /// after a few hundred lists or need all of them. Returns `None` as soon as the lists would
+    /// hold more than `give_up` vectors (the planner then uses the inverted index instead).
+    fn filtered_lists(
+        &self,
+        qr: &[f32],
+        nprobe: usize,
+        f: &Filter,
+        budget: usize,
+        give_up: f64,
+    ) -> Option<(Vec<(f32, u32)>, usize)> {
+        let d = self.d;
+        let mut all: Vec<(f32, u32)> = self
+            .centroids
+            .chunks_exact(d)
+            .enumerate()
+            .map(|(c, cen)| (self.cnorms[c] - 2.0 * dot(qr, cen), c as u32))
+            .collect();
+        let cmp = |a: &(f32, u32), b: &(f32, u32)| a.0.total_cmp(&b.0);
+        let (mut sorted, mut chunk) = (0usize, nprobe.max(64));
+        let (mut chosen, mut passing, mut scanned) = (Vec::new(), 0usize, 0usize);
+        let mut i = 0;
+        while i < all.len() {
+            if i == sorted {
+                let end = (sorted + chunk).min(all.len());
+                let rest = &mut all[sorted..];
+                if end - sorted < rest.len() {
+                    rest.select_nth_unstable_by(end - sorted - 1, cmp);
+                }
+                all[sorted..end].sort_unstable_by(cmp);
+                sorted = end;
+                chunk *= 2;
+            }
+            let (dist, c) = all[i];
+            i += 1;
+            let cnt = f.labels.count(c as usize, f.label) as usize;
+            if cnt > 0 {
+                chosen.push((dist, c));
+                passing += cnt;
+                scanned += (self.offsets[c as usize + 1] - self.offsets[c as usize]) as usize;
+                if scanned as f64 > give_up {
+                    return None;
+                }
+            }
+            if i >= nprobe && passing >= budget {
+                break;
+            }
+        }
+        Some((chosen, scanned))
+    }
+
+    fn search_impl(
+        &self,
+        q: &[f32],
+        p: &SearchParams,
+        refine: Option<&Refine>,
+        base: Option<&Fbin>,
+        times: Option<&mut StageTimes>,
+        filter: Option<&Filter>,
+    ) -> (Vec<Hit>, FilterStats) {
         let d = self.d;
         let cb = self.code_bytes();
         let nprobe = p.nprobe.min(self.nlist);
         let k = p.k;
         let t0 = Instant::now();
+        let mut stats = FilterStats::default();
 
         // Rotate the query once; distances to rotated centroids equal distances to originals.
         let mut qr = vec![0f32; d];
@@ -479,110 +623,191 @@ impl IvfIndex {
             qr.copy_from_slice(q);
         }
 
-        // Stage 1: nearest lists.
-        let cd = self.nearest_lists(&qr, nprobe);
+        // Stage 1: which lists (or, for the inverted-index strategy, no lists at all).
+        let mode = match filter {
+            None => None,
+            Some(f) if f.mode == FilterMode::Postings && refine.is_none() => Some(FilterMode::Scan),
+            Some(f) => Some(f.mode),
+        };
+        let mut mode_used = mode;
+        let cd = match (filter, mode) {
+            (Some(f), Some(FilterMode::Scan | FilterMode::Auto)) => {
+                let budget = f.budget.min(f.labels.frequency(f.label));
+                // Auto: stop walking as soon as scanning would cost more than the postings.
+                let give_up = if mode == Some(FilterMode::Auto) && refine.is_some() {
+                    f.labels.frequency(f.label) as f64 * f.postings_cost
+                } else {
+                    f64::INFINITY
+                };
+                match self.filtered_lists(&qr, nprobe, f, budget, give_up) {
+                    Some((lists, scanned)) => {
+                        mode_used = Some(FilterMode::Scan);
+                        stats.scanned = scanned;
+                        lists
+                    }
+                    None => {
+                        mode_used = Some(FilterMode::Postings);
+                        Vec::new()
+                    }
+                }
+            }
+            (Some(_), Some(FilterMode::Postings)) => Vec::new(),
+            _ => {
+                let cd = self.nearest_lists(&qr, nprobe);
+                stats.scanned = cd
+                    .iter()
+                    .map(|&(_, c)| {
+                        (self.offsets[c as usize + 1] - self.offsets[c as usize]) as usize
+                    })
+                    .sum();
+                cd
+            }
+        };
+        stats.used = mode_used;
+        stats.lists = cd.len();
+        if mode_used != Some(FilterMode::Postings) && filter.is_some() {
+            stats.probed = cd.iter().map(|&(_, c)| c).collect();
+        }
+        let in_scan = match (filter, mode_used) {
+            (Some(f), Some(FilterMode::Scan)) => Some(f),
+            _ => None,
+        };
         let t1 = Instant::now();
 
-        // Stage 2: scan the 1-bit codes of those lists. Candidates are kept by *slot* (position
-        // in list order), which is where the refine codes live; ids are looked up at the end.
         let use_refine = refine.is_some() && p.refine_k > 0;
-        let keep = if use_refine {
-            p.refine_k.max(p.rerank).max(k)
-        } else if p.rerank > 0 {
-            p.rerank.max(k)
-        } else {
-            k
-        };
-        let mut cand = Collector::new(keep, p.heap);
+        let want = if p.rerank > 0 { p.rerank.max(k) } else { k };
         let mut r = vec![0f32; d];
-        let fast = self.is_fastscan();
-        let mut lut = vec![0f32; if fast { 0 } else { cb * 256 }];
-        let mut qlut = vec![0u8; if fast { 2 * cb * 16 } else { 0 }];
-        let mut sums: Vec<u16> = Vec::new();
-        for &(_, c) in &cd {
-            let c = c as usize;
-            let cen = &self.centroids[c * d..(c + 1) * d];
-            for j in 0..d {
-                r[j] = qr[j] - cen[j];
-            }
-            let rr = dot(&r, &r);
-            let (lo, hi) = (self.offsets[c] as usize, self.offsets[c + 1] as usize);
 
-            if fast {
-                // FastScan: integer scores for 32 vectors per SIMD step, then one pass to turn
-                // them into distance estimates.
-                let (delta, bias) = fastscan::build_qlut(&r, &mut qlut);
-                let bb = fastscan::block_bytes(2 * cb);
-                let (b0, b1) = (self.fs_offsets[c] as usize, self.fs_offsets[c + 1] as usize);
-                sums.resize((b1 - b0) * fastscan::BLOCK, 0);
-                fastscan::scan(&self.fs_blocks[b0 * bb..b1 * bb], 2 * cb, &qlut, &mut sums);
-                let mut thr = cand.threshold();
-                let (rn, sc) = (&self.rnorm[lo..hi], &self.scale[lo..hi]);
-                for (v, ((&sum, &rn), &sc)) in sums.iter().zip(rn).zip(sc).enumerate() {
+        let dense = in_scan.is_some_and(|f| {
+            let m = f.labels.frequency(f.label);
+            4 * m >= self.n && 4 * m <= 3 * self.n
+        });
+        let mut cand: Vec<Hit>;
+        let t2;
+        if let (Some(f), Some(FilterMode::Postings), Some(rf)) = (filter, mode_used, refine) {
+            // Stage 2+3, inverted-index strategy: score exactly the matching vectors, from their
+            // 4-bit codes (no 1-bit pass: there is nothing to prune). Postings are in slot order,
+            // so lists come one after another, as in the refine stage.
+            let posts = f.labels.postings(f.label);
+            stats.scanned = posts.len();
+            let mut best = Collector::new(want, p.heap);
+            self.refine_slots(&qr, posts.iter().copied(), rf, &mut r, &mut best);
+            cand = best.into_sorted();
+            t2 = Instant::now();
+        } else {
+            // Stage 2: scan the 1-bit codes of those lists. Candidates are kept by *slot*
+            // (position in list order), which is where the refine codes live; ids are looked up
+            // at the end.
+            let keep = if use_refine {
+                p.refine_k.max(want)
+            } else {
+                want
+            };
+            let mut col = Collector::new(keep, p.heap);
+            let fast = self.is_fastscan();
+            let mut lut = vec![0f32; if fast { 0 } else { cb * 256 }];
+            let mut qlut = vec![0u8; if fast { 2 * cb * 16 } else { 0 }];
+            let mut sums: Vec<u16> = Vec::new();
+            for &(_, c) in &cd {
+                let c = c as usize;
+                let cen = &self.centroids[c * d..(c + 1) * d];
+                for j in 0..d {
+                    r[j] = qr[j] - cen[j];
+                }
+                let rr = dot(&r, &r);
+                let (lo, hi) = (self.offsets[c] as usize, self.offsets[c + 1] as usize);
+
+                if fast {
+                    // FastScan: integer scores for 32 vectors per SIMD step, then one pass to
+                    // turn them into distance estimates.
+                    let (delta, bias) = fastscan::build_qlut(&r, &mut qlut);
+                    let bb = fastscan::block_bytes(2 * cb);
+                    let (b0, b1) = (self.fs_offsets[c] as usize, self.fs_offsets[c + 1] as usize);
+                    sums.resize((b1 - b0) * fastscan::BLOCK, 0);
+                    fastscan::scan(&self.fs_blocks[b0 * bb..b1 * bb], 2 * cb, &qlut, &mut sums);
+                    let mut thr = col.threshold();
+                    let (rn, sc) = (&self.rnorm[lo..hi], &self.scale[lo..hi]);
+                    let it = sums.iter().zip(rn).zip(sc).enumerate();
+                    if let Some(f) = in_scan {
+                        let lab = f.labels.labels(lo, hi);
+                        if dense {
+                            // Near 50% selectivity the label test is a coin flip the CPU
+                            // mispredicts half the time; `&` instead of `&&` folds it into the
+                            // threshold test, a branch that is almost always false.
+                            for (v, ((&sum, &rn), &sc)) in it {
+                                let est = rr + rn - 2.0 * sc * (delta * sum as f32 + bias);
+                                if (est < thr) & (lab[v] == f.label) {
+                                    col.push(est, (lo + v) as u32);
+                                    thr = col.threshold();
+                                }
+                            }
+                        } else {
+                            // Rare or common labels: the label test is predictable, and skipping
+                            // the arithmetic for non-matching vectors is the cheaper choice.
+                            for (v, ((&sum, &rn), &sc)) in it {
+                                if lab[v] != f.label {
+                                    continue;
+                                }
+                                let est = rr + rn - 2.0 * sc * (delta * sum as f32 + bias);
+                                if est < thr {
+                                    col.push(est, (lo + v) as u32);
+                                    thr = col.threshold();
+                                }
+                            }
+                        }
+                    } else {
+                        for (v, ((&sum, &rn), &sc)) in it {
+                            let est = rr + rn - 2.0 * sc * (delta * sum as f32 + bias);
+                            if est < thr {
+                                col.push(est, (lo + v) as u32);
+                                thr = col.threshold();
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                build_lut(&r, &mut lut);
+                let codes = &self.codes[lo * cb..hi * cb];
+                for (v, code) in codes.chunks_exact(cb).enumerate() {
                     let slot = lo + v;
-                    let s = delta * sum as f32 + bias;
-                    let est = rr + rn - 2.0 * sc * s;
-                    if est < thr {
-                        cand.push(est, slot as u32);
-                        thr = cand.threshold();
+                    if let Some(f) = in_scan {
+                        if f.labels.label(slot) != f.label {
+                            continue;
+                        }
+                    }
+                    let mut s = 0.0f32;
+                    for (j, &b) in code.iter().enumerate() {
+                        s += lut[j * 256 + b as usize];
+                    }
+                    let est = rr + self.rnorm[slot] - 2.0 * self.scale[slot] * s;
+                    if est < col.threshold() {
+                        col.push(est, slot as u32);
                     }
                 }
-                continue;
             }
+            cand = match (use_refine, refine) {
+                // The refine stage doesn't need distance order. Slot order instead makes its
+                // reads into the 5.6 GB refine array run forwards, list by list.
+                (true, Some(_)) => {
+                    let mut v = col.into_unsorted();
+                    v.sort_unstable_by_key(|h| h.id);
+                    v
+                }
+                _ => col.into_sorted(),
+            };
+            t2 = Instant::now();
 
-            build_lut(&r, &mut lut);
-            let codes = &self.codes[lo * cb..hi * cb];
-            for (v, code) in codes.chunks_exact(cb).enumerate() {
-                let mut s = 0.0f32;
-                for (j, &b) in code.iter().enumerate() {
-                    s += lut[j * 256 + b as usize];
-                }
-                let slot = lo + v;
-                let est = rr + self.rnorm[slot] - 2.0 * self.scale[slot] * s;
-                if est < cand.threshold() {
-                    cand.push(est, slot as u32);
-                }
+            // Stage 3: 4-bit refine in RAM.
+            if let (true, Some(rf)) = (use_refine, refine) {
+                let mut best = Collector::new(want, true);
+                self.refine_slots(&qr, cand.iter().map(|h| h.id), rf, &mut r, &mut best);
+                cand = best.into_sorted();
             }
         }
-        let mut cand = match (use_refine, refine) {
-            // The refine stage doesn't need distance order. Slot order instead makes its reads
-            // into the 5.6 GB refine array run forwards, list by list.
-            (true, Some(_)) => {
-                let mut v = cand.into_unsorted();
-                v.sort_unstable_by_key(|h| h.id);
-                v
-            }
-            _ => cand.into_sorted(),
-        };
-        let t2 = Instant::now();
-
-        // Stage 3: 4-bit refine in RAM.
-        if let (true, Some(rf)) = (use_refine, refine) {
-            let want = if p.rerank > 0 { p.rerank.max(k) } else { k };
-            let mut better = TopK::new(want);
-            // Candidates are in slot order, so lists come one after another: find each list
-            // once by binary search and compute its query residual once.
-            let mut list_end = 0usize;
-            const AHEAD: usize = 8;
-            for h in cand.iter().take(AHEAD) {
-                rf.prefetch(h.id as usize);
-            }
-            for (i, h) in cand.iter().enumerate() {
-                if let Some(n) = cand.get(i + AHEAD) {
-                    rf.prefetch(n.id as usize);
-                }
-                let slot = h.id as usize;
-                if slot >= list_end {
-                    let c = self.offsets.partition_point(|&o| o as usize <= slot) - 1;
-                    list_end = self.offsets[c + 1] as usize;
-                    let cen = &self.centroids[c * d..(c + 1) * d];
-                    for j in 0..d {
-                        r[j] = qr[j] - cen[j];
-                    }
-                }
-                better.push(rf.dist(slot, &r), h.id);
-            }
-            cand = better.into_sorted();
+        // Post-filtering: the unfiltered search ran; drop what doesn't match before the disk.
+        if let (Some(f), Some(FilterMode::Post)) = (filter, mode_used) {
+            cand.retain(|h| f.labels.label(h.id as usize) == f.label);
         }
         let t3 = Instant::now();
 
@@ -618,7 +843,43 @@ impl IvfIndex {
             t.refine += (t3 - t2).as_secs_f64();
             t.rerank += (t4 - t3).as_secs_f64();
         }
-        out
+        (out, stats)
+    }
+
+    /// 4-bit distances for slots given in ascending order: each list's query residual is
+    /// computed once, and codes are prefetched a few slots ahead.
+    fn refine_slots(
+        &self,
+        qr: &[f32],
+        slots: impl Iterator<Item = u32> + Clone,
+        rf: &Refine,
+        r: &mut [f32],
+        out: &mut Collector,
+    ) {
+        let d = self.d;
+        // Far enough ahead to keep ~16 cache misses in flight (the inverted-index path touches
+        // vectors spread over the whole 5.6 GB array, so nearly every one is a miss).
+        const AHEAD: usize = 16;
+        let mut ahead = slots.clone().skip(AHEAD);
+        for s in slots.clone().take(AHEAD) {
+            rf.prefetch(s as usize);
+        }
+        let mut list_end = 0usize;
+        for s in slots {
+            if let Some(n) = ahead.next() {
+                rf.prefetch(n as usize);
+            }
+            let slot = s as usize;
+            if slot >= list_end {
+                let c = self.offsets.partition_point(|&o| o as usize <= slot) - 1;
+                list_end = self.offsets[c + 1] as usize;
+                let cen = &self.centroids[c * d..(c + 1) * d];
+                for j in 0..d {
+                    r[j] = qr[j] - cen[j];
+                }
+            }
+            out.push(rf.dist(slot, r), s);
+        }
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -758,6 +1019,7 @@ pub fn build_lut(r: &[f32], lut: &mut [f32]) {
 /// Plain-old-data types we can write as raw little-endian bytes (x86/ARM are little-endian).
 pub trait Pod: Copy + Default {}
 impl Pod for u8 {}
+impl Pod for u16 {}
 impl Pod for u32 {}
 impl Pod for u64 {}
 impl Pod for f32 {}

@@ -6,13 +6,16 @@ Approximate nearest-neighbour search over large vector sets on a single machine,
 > only 50 full vectors from SSD per query. In RAM: a 2.4 GB 1-bit index plus a 5.6 GB 4-bit
 > refine tier; the 38 GB of full vectors stay on disk.
 > Deep 10M: 0.995 recall@10 at 2.0 ms p99.
+> **Filtered** (only vectors with a given label, from 50% of the data down to 0.01%): recall@10
+> ≥ 0.99 at ≤ 21 ms p99 on Deep 100M. Searching first and filtering after drops to 0.49 at 10%
+> and 0.001 at 0.01%.
 
 Every number below comes from a CSV in `results/`, written by `binvec bench`, with ground truth
 from the [NeurIPS'21 Big-ANN benchmark](https://big-ann-benchmarks.com/neurips21.html).
 Machine: Dell Inspiron 16 7610, i7-11800H (8 cores), 16 GB RAM, NVMe SSD, WSL2 (Kali) with 11 GB
 given to Linux, on mains power. Latency is one query at a time on one thread; QPS uses 16 threads.
 
-## Results (v0.5)
+## Results (v0.6)
 
 ### Deep 100M, cold cache
 
@@ -56,6 +59,40 @@ p99; three repeats of the same setting gave 9.6–10.6 ms. It is reported, not u
 | 128 | 2,000 | 50 | 0.994 | 0.996 | 1.19 | 1.57 | 3,846 |
 | 128 | 5,000 | 50 | **0.995** | 0.996 | 1.48 | **1.98** | 3,090 |
 
+### Filtered search, Deep 100M, cold cache
+
+"Nearest neighbours of q among vectors with label L", for labels that cover 50% down to 0.01% of
+the data. Labels are synthetic with planted frequencies, so selectivity is exact. **Uniform**
+labels are independent of the vectors; **correlated** labels each occupy a slab of space, so a
+query's filtered neighbours are often far from it. Ground truth is exact (brute force over the
+matching vectors, `binvec filter-gt`), 500 queries per label; latency over 100. nprobe 256,
+refine 5,000, rerank 50.
+
+| Label covers | Search, then filter: recall@10 | Planner (`auto`) picks | recall@10 | p50 ms | p99 ms |
+|---|---|---|---|---|---|
+| 50% | 0.993 | in-scan filter | 0.995 | 8.2 | 10.2 |
+| 10% | 0.490 | in-scan filter | 0.996 | 8.4 | 12.8 |
+| 1% | 0.045 | in-scan filter | 0.993 | 10.3 | 12.9 |
+| 0.1% | 0.004 | inverted index | 1.000 | 8.0 | 20.1 |
+| 0.01% | 0.001 | inverted index | 1.000 | 1.9 | 6.7 |
+
+Uniform labels (`results/phase3-100M-cold.csv` for the baseline, `results/phase3b-100M-cold.csv`
+for `auto`, run 2). Correlated labels, same settings, both runs: recall 0.991–1.000, p99
+3.1–17.1 ms (`results/phase3b-100M-cold.csv`).
+
+Each strategy alone (uniform, p50 ms; `results/phase3b-100M-cold.csv`):
+
+| Label covers | in-scan filter | inverted index |
+|---|---|---|
+| 1% | 7.8 | 94 (phase 3, before the deeper prefetch) |
+| 0.1% | 44 | 7.6 |
+| 0.01% | 97 | 1.2 |
+
+Neither wins everywhere; the planner picks the cheaper one per query, before scoring anything.
+
+Deep 10M, data in RAM (`results/phase3-10M-sweep.csv`, `auto`, uniform, nprobe 128): recall@10
+0.991–1.000 for every label, p99 0.6–12.2 ms.
+
 ## How it works
 
 A query runs in four stages; each throws away fewer candidates than the last and spends more
@@ -75,6 +112,18 @@ per candidate.
 4. **Exact rerank, from SSD.** The best 20–50 are read from the full-precision file (memory-mapped)
    and scored exactly. All reads are issued at once (`madvise(WILLNEED)`), so the SSD serves them
    in parallel.
+
+**Filtered queries** (`src/filter.rs`, `IvfIndex::search_filtered`) have two ways in, chosen per
+query:
+- **In-scan filter.** Stage 2 skips vectors without the label, and keeps probing clusters
+  (nearest first, skipping clusters with no match) until a budget of matching vectors is covered.
+  Cost grows as the label gets rarer, because more clusters have to be walked.
+- **Inverted index.** For each label, the sorted list of vectors that carry it. Stages 1–2 are
+  skipped: every matching vector is scored from its 4-bit code, then the best 50 are reranked.
+  Cost grows with the number of matches.
+- **Planner.** Per-cluster label counts give both costs before any scoring: the vectors the scan
+  would walk vs. matches × 30 (one 4-bit score costs about 30 FastScan scores, measured). The walk
+  stops as soon as it would cost more than the index.
 
 | Tier | Where | Bytes/vector | At 100M |
 |---|---|---|---|
@@ -159,6 +208,27 @@ measured separately on Deep 10M (nprobe 128 / refine 5,000 / rerank 50, `results
   recall ceiling from 0.991 to 0.997. At nprobe 512 the ceiling is 0.999, but the scan
   (9.7 ms) dominates again.
 
+**v0.6: filtered search** (`results/phase3*.csv`).
+- **Searching first and filtering after fails exactly as expected.** With rerank 50, a label on
+  10% of vectors leaves ~5 candidates: recall 0.49. At 0.01% it is 0.001.
+- **In-scan filtering needs a stopping rule.** Probing until a budget of *matching* vectors is
+  covered adapts on its own to rare and to correlated labels. On Deep 10M at 1%
+  (`results/phase3-10M*.csv`): budget 5,000 → 0.991 recall at 2.4 ms p50; 20,000 → 0.999 at
+  6.9 ms; 50,000 → 1.000 at 16.6 ms.
+- **The planner's constant came from measurement.** I guessed 10; the stage timings said one
+  4-bit score costs ~30 FastScan scores (95 ns vs 3 ns at 100M). With 30, the planner picks the
+  faster strategy at every selectivity tested, at 10M and 100M.
+- **Rare labels are a memory-latency problem.** Matching vectors are spread over the whole 5.6 GB
+  refine array, so each is a cache miss. Prefetching 16 ahead (and the two per-vector floats as
+  well as the codes) halved the 0.1% case: 15.2 → 7.6 ms p50.
+- **An unexplained slow run, reported.** The first run of phase 3b (`auto`, uniform) was 3–18×
+  slower at 50–1% than the same plans one run later, with **zero** major faults and zero swap
+  (`results/phase3b-100M-cold.csv`, run 1). Linux paged nothing, so the likely cause is again
+  outside the VM. Run 2 and both correlated runs are normal; run 2 is what the table shows.
+- **A mispredicted branch.** At 50% selectivity, testing the label before the threshold is a coin
+  flip for the branch predictor. Folding both tests into one (`&` instead of `&&`) is used for
+  labels between 25% and 75%; outside that range skipping early is cheaper.
+
 ## Reproduce
 
 Needs Linux (WSL2 is fine) and Rust. Disk: ~5 GB for 10M, ~55 GB for 100M with all tiers.
@@ -175,6 +245,8 @@ scripts/phase1.sh                  # v0.4: refine tier, stage timing, two-level 
 scripts/phase1b.sh                 # v0.4: memory-mapped loading, grid, repeats
 scripts/phase2.sh                  # v0.5: FastScan conversion, ablation, old vs new path
 scripts/phase2b.sh                 # v0.5: repeats at nprobe 128 / 256, nprobe 512
+scripts/phase3.sh                  # v0.6: labels, filtered ground truth, all filter strategies
+scripts/phase3b.sh                 # v0.6: planner re-check with fault counters, prefetch
 ```
 
 Synthetic data, no download:
@@ -190,6 +262,17 @@ $B bench --index data/syn1m/idx.bin --base data/syn1m/base.fbin \
          --refine data/syn1m/refine.bin --refine-k 1000 --rerank 30
 ```
 
+Filtered, on the same data:
+
+```bash
+$B labels --base data/syn1m/base.fbin --kind correlated --out data/syn1m/labels.bin
+$B filter-gt --base data/syn1m/base.fbin --queries data/syn1m/query.fbin \
+             --labels data/syn1m/labels.bin --nq 500 --out data/syn1m/gt-filtered.bin
+$B fbench --index data/syn1m/idx.bin --base data/syn1m/base.fbin --refine data/syn1m/refine.bin \
+          --queries data/syn1m/query.fbin --labels data/syn1m/labels.bin \
+          --gt data/syn1m/gt-filtered.bin --nprobe 16 --refine-k 2000 --rerank 50
+```
+
 ## Roadmap
 
 - [x] k-means IVF, residual 1-bit codes, lookup-table scan, exact rerank
@@ -200,7 +283,7 @@ $B bench --index data/syn1m/idx.bin --base data/syn1m/base.fbin \
 - [x] 4-bit refine tier in RAM; memory-mapped index files
 - [x] Two-level approximate centroid assignment (2.4× faster 100M build)
 - [x] SIMD (FastScan) scan kernel, reservoir collector, vectorised refine
-- [ ] Filtered search with inverted indexes
+- [x] Filtered search: in-scan filter, inverted index, cost-based planner
 - [ ] Head-to-head with FAISS on the same machine
 - [ ] Write-up
 
@@ -208,7 +291,8 @@ $B bench --index data/syn1m/idx.bin --base data/syn1m/base.fbin \
 
 | File | What it does |
 |---|---|
-| `src/ivf.rs` | The index: build, search (4 stages), save/load |
+| `src/ivf.rs` | The index: build, search (4 stages), filtered search and planner, save/load |
+| `src/filter.rs` | Labels, inverted index, per-cluster label counts |
 | `src/fastscan.rs` | FastScan block layout and AVX2 scan kernel (with a scalar fallback) |
 | `src/refine.rs` | 4-bit refine tier |
 | `src/kmeans.rs` | k-means; exact and two-level centroid assignment |
@@ -216,5 +300,5 @@ $B bench --index data/syn1m/idx.bin --base data/syn1m/base.fbin \
 | `src/dist.rs` | Distance kernels |
 | `src/io.rs` | Big-ANN file formats; memory-mapped full vectors, prefetch |
 | `src/topk.rs` | Heap and reservoir collectors for the k best candidates |
-| `src/bin/binvec.rs` | CLI: `gen`, `verify`, `build`, `convert`, `refine`, `bench`, `ceiling` |
+| `src/bin/binvec.rs` | CLI: `gen`, `verify`, `build`, `convert`, `refine`, `bench`, `ceiling`, `labels`, `filter-gt`, `fbench` |
 | `results/` | Raw output of every benchmark run quoted above |
