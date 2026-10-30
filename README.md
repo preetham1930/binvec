@@ -9,13 +9,15 @@ Approximate nearest-neighbour search over large vector sets on a single machine,
 > **Filtered** (only vectors with a given label, from 50% of the data down to 0.01%): recall@10
 > ≥ 0.99 at ≤ 21 ms p99 on Deep 100M. Searching first and filtering after drops to 0.49 at 10%
 > and 0.001 at 0.01%.
+> **Against FAISS** (Deep 10M, same laptop): as fast as FAISS's fastest IVF index per query at
+> 0.985–0.999 recall, with 5× less RAM; FAISS has higher batch throughput.
 
 Every number below comes from a CSV in `results/`, written by `binvec bench`, with ground truth
 from the [NeurIPS'21 Big-ANN benchmark](https://big-ann-benchmarks.com/neurips21.html).
 Machine: Dell Inspiron 16 7610, i7-11800H (8 cores), 16 GB RAM, NVMe SSD, WSL2 (Kali) with 11 GB
 given to Linux, on mains power. Latency is one query at a time on one thread; QPS uses 16 threads.
 
-## Results (v0.6)
+## Results (v0.7)
 
 ### Deep 100M, cold cache
 
@@ -92,6 +94,42 @@ Neither wins everywhere; the planner picks the cheaper one per query, before sco
 
 Deep 10M, data in RAM (`results/phase3-10M-sweep.csv`, `auto`, uniform, nprobe 128): recall@10
 0.991–1.000 for every label, p99 0.6–12.2 ms.
+
+### Against FAISS, Deep 10M, same laptop
+
+Same data, queries and ground truth; same measurement (latency: one query per call on one
+thread; QPS: all 16 threads, FAISS through its batch API). Everything in RAM for both: binvec's
+full vectors are a memory-mapped file, in the page cache at 10M. FAISS 1.15.1 from pip, each
+index swept over nprobe 32–256 and rerank depth (`k_factor`) 10–200.
+
+![Recall vs latency, binvec vs FAISS](results/phase4-10M.png)
+
+Closest setting to each recall level (`results/phase4-*-10M.csv`):
+
+| recall@10 ≈ | binvec | FAISS IVF-PQ 4-bit FastScan + full-vector rerank | FAISS IVF-RaBitQ FastScan + full-vector rerank | FAISS IVF-Flat |
+|---|---|---|---|---|
+| 0.985 | 0.76 / 1.28 ms, 6,747 QPS | 0.86 / 1.49 ms, 8,401 QPS | 2.19 / 3.62 ms, 1,413 QPS | 4.32 / 6.93 ms, 490 QPS |
+| 0.995 | 1.43 / 2.06 ms, 3,298 QPS | 1.22 / 2.07 ms, 5,987 QPS | 3.38 / 5.76 ms, 1,193 QPS | 8.85 / 31.0 ms, 257 QPS |
+| 0.999 | 2.29 / 2.80 ms, 2,002 QPS | 2.20 / 3.41 ms, 3,054 QPS | 5.21 / 9.00 ms, 784 QPS | 14.9 / 20.2 ms, 134 QPS |
+| RAM for the index | **0.80 GB** | 4.16 GB | 4.12 GB | 3.92 GB |
+| Build | (existing index) | 215 s | 215 s | 126 s |
+
+(p50 / p99, single query; QPS on 16 threads.)
+
+What this does and doesn't show:
+- **Per-query latency: level with FAISS's fastest IVF index**, within 17% at p50 either way and
+  equal or lower at p99 from 0.985 to 0.999 recall, **using 5.2× less RAM**.
+- **Throughput: FAISS wins**, 1.25× at 0.985 and 1.5–1.8× at ≥ 0.995. Its batch API amortises
+  work across queries; binvec runs one query per thread.
+- **FAISS's RaBitQ index (the same 1-bit idea) is 2.3–2.9× slower** here at the same recall. I
+  haven't profiled FAISS, so I don't claim why.
+- **The RAM column is the point.** FAISS's configurations that reach 0.99 here keep every full
+  vector in RAM: ~41 GB at 100M, which doesn't fit on this laptop. binvec runs 100M in 8 GB of
+  RAM. FAISS's memory-lean option (RaBitQ + 8-bit rerank, 1.24 GB) tops out at 0.976 recall;
+  its 4-bit RaBitQ variant was slower than IVF-PQ at every recall (`results/phase4-faiss-10M.csv`).
+- One machine, one dataset, FAISS's default build parameters, tuned by nprobe and `k_factor`.
+  Python call overhead (microseconds) is included in FAISS's latency. IVF-Flat's 71 ms p99 at
+  nprobe 32 was the first setting after its build and is likely warm-up.
 
 ## How it works
 
@@ -229,6 +267,14 @@ measured separately on Deep 10M (nprobe 128 / refine 5,000 / rerank 50, `results
   flip for the branch predictor. Folding both tests into one (`&` instead of `&&`) is used for
   labels between 25% and 75%; outside that range skipping early is cheaper.
 
+**v0.7: a head-to-head with FAISS** (`results/phase4-*.csv`, `scripts/faiss_compare.py`).
+- Same harness rules for both: the same queries, ground truth, single-thread one-query latency
+  and all-core QPS, so the comparison is about the indexes, not the measurement.
+- The result is a draw on per-query speed and a 5× win on memory, which is the trade this design
+  was built for: it is what makes 100M fit on a 16 GB laptop.
+- FAISS's batch throughput is higher. Batching queries (scoring several queries per list scan)
+  is the obvious next step for binvec's throughput.
+
 ## Reproduce
 
 Needs Linux (WSL2 is fine) and Rust. Disk: ~5 GB for 10M, ~55 GB for 100M with all tiers.
@@ -247,6 +293,7 @@ scripts/phase2.sh                  # v0.5: FastScan conversion, ablation, old vs
 scripts/phase2b.sh                 # v0.5: repeats at nprobe 128 / 256, nprobe 512
 scripts/phase3.sh                  # v0.6: labels, filtered ground truth, all filter strategies
 scripts/phase3b.sh                 # v0.6: planner re-check with fault counters, prefetch
+scripts/phase4.sh                  # v0.7: binvec vs FAISS, Deep 10M (installs FAISS in a venv)
 ```
 
 Synthetic data, no download:
@@ -284,7 +331,7 @@ $B fbench --index data/syn1m/idx.bin --base data/syn1m/base.fbin --refine data/s
 - [x] Two-level approximate centroid assignment (2.4× faster 100M build)
 - [x] SIMD (FastScan) scan kernel, reservoir collector, vectorised refine
 - [x] Filtered search: in-scan filter, inverted index, cost-based planner
-- [ ] Head-to-head with FAISS on the same machine
+- [x] Head-to-head with FAISS on the same machine
 - [ ] Write-up
 
 ## Layout
@@ -301,4 +348,5 @@ $B fbench --index data/syn1m/idx.bin --base data/syn1m/base.fbin --refine data/s
 | `src/io.rs` | Big-ANN file formats; memory-mapped full vectors, prefetch |
 | `src/topk.rs` | Heap and reservoir collectors for the k best candidates |
 | `src/bin/binvec.rs` | CLI: `gen`, `verify`, `build`, `convert`, `refine`, `bench`, `ceiling`, `labels`, `filter-gt`, `fbench` |
+| `scripts/faiss_compare.py`, `scripts/plot_phase4.py` | FAISS benchmark with the same measurements; the recall/latency chart |
 | `results/` | Raw output of every benchmark run quoted above |
