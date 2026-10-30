@@ -1,0 +1,13 @@
+label,n,nlist,nprobe,rerank,recall10,p50_ms,p99_ms,mean_ms,qps,threads,ram_gb
+"deep100M nlist=16384 Preetham v0.3 cold repeat rot+unbiased prefetch",100000000,16384,32,500,0.9210,20.797,38.473,21.599,370,16,2.406
+"deep100M nlist=16384 Preetham v0.3 cold repeat rot+unbiased prefetch",100000000,16384,32,500,0.9210,8.645,16.147,9.318,446,16,2.406
+"deep100M nlist=16384 Preetham v0.3 cold repeat rot+unbiased prefetch",100000000,16384,32,500,0.9210,7.856,11.851,8.037,462,16,2.406
+"deep100M nlist=16384 Preetham v0.3 cold repeat rot+unbiased prefetch",100000000,16384,64,500,0.9488,10.835,48.846,13.394,205,16,2.406
+"deep100M nlist=16384 Preetham v0.3 cold repeat rot+unbiased prefetch",100000000,16384,64,500,0.9488,15.487,35.344,16.784,250,16,2.406
+"deep100M nlist=16384 Preetham v0.3 cold repeat rot+unbiased prefetch",100000000,16384,64,500,0.9488,21.448,59.279,25.150,265,16,2.406
+"deep100M nlist=16384 Preetham v0.3 cold repeat rot+unbiased prefetch",100000000,16384,128,500,0.9578,22.466,97.670,27.962,65,16,2.406
+"deep100M nlist=16384 Preetham v0.3 cold repeat rot+unbiased prefetch",100000000,16384,128,500,0.9578,16.195,28.483,17.032,248,16,2.406
+"deep100M nlist=16384 Preetham v0.3 cold repeat rot+unbiased prefetch",100000000,16384,128,500,0.9578,13.509,23.608,14.180,277,16,2.406
+"deep100M nlist=16384 Preetham v0.3 cold repeat rot+unbiased prefetch",100000000,16384,128,1000,0.9785,19.562,30.265,20.177,55,16,2.406
+"deep100M nlist=16384 Preetham v0.3 cold repeat rot+unbiased prefetch",100000000,16384,128,1000,0.9785,34.750,54.844,34.916,82,16,2.406
+"deep100M nlist=16384 Preetham v0.3 cold repeat rot+unbiased prefetch",100000000,16384,128,1000,0.9785,36.529,80.955,37.125,73,16,2.406

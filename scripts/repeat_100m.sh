@@ -13,7 +13,7 @@ BIN=$CARGO_TARGET_DIR/release/binvec
 NLIST=${NLIST:-16384}
 IDX="$DATA/idx-100M-$NLIST-rot-unbiased.bin"
 REPS=${REPS:-3}
-CSV=results/repeats-100M.csv
+CSV=results/repeats-100M-v2.csv
 LABEL="deep100M nlist=$NLIST $(uname -n) v0.3 cold repeat"
 
 cargo build --release
@@ -30,7 +30,7 @@ for cfg in "32 500" "64 500" "128 500" "128 1000"; do
   np=$1; rr=$2
   echo
   echo "== nprobe $np, rerank $rr: $REPS cold runs =="
-  echo " nprobe  rerank recall@10   p50 ms   p99 ms  mean ms        QPS"
+  echo "nprobe refine rerank recall@10   p50 ms   p99 ms  mean ms     QPS  |   cent   scan refine rerank"
   ROWS=""
   for rep in $(seq 1 "$REPS"); do
     drop_caches
@@ -41,12 +41,12 @@ for cfg in "32 500" "64 500" "128 500" "128 1000"; do
     echo "$ROW"
     ROWS+="$ROW"$'\n'
   done
-  # Median and range of p50 (column 4) and p99 (column 5) across the runs.
+  # Median and range of p50 (column 5) and p99 (column 6) across the runs.
   # (sort + plain awk, so it works with any awk, not only GNU awk.)
-  REC=$(printf '%s' "$ROWS" | awk 'NF {r=$3} END {print r}')
+  REC=$(printf '%s' "$ROWS" | awk 'NF {r=$4} END {print r}')
   MID=$(( (REPS + 1) / 2 ))
-  P50=$(printf '%s' "$ROWS" | awk 'NF {print $4}' | sort -g | sed -n "${MID}p")
-  P99S=$(printf '%s' "$ROWS" | awk 'NF {print $5}' | sort -g)
+  P50=$(printf '%s' "$ROWS" | awk 'NF {print $5}' | sort -g | sed -n "${MID}p")
+  P99S=$(printf '%s' "$ROWS" | awk 'NF {print $6}' | sort -g)
   P99=$(printf '%s\n' "$P99S" | sed -n "${MID}p")
   LO=$(printf '%s\n' "$P99S" | head -1)
   HI=$(printf '%s\n' "$P99S" | tail -1)

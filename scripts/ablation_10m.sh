@@ -40,11 +40,11 @@ for v in norot-ls norot-unbiased rot-ls rot-unbiased; do
   echo "== benchmark: $v =="
   $BIN bench --index "$DATA/idx-10M-$NLIST-$v.bin" "${COMMON[@]}" \
     --nprobe 16,32,64 --rerank 0,100,200,500 --nq-latency 1000 \
-    --csv results/ablation.csv --label "$LABEL"
+    --csv results/ablation-v2.csv --label "$LABEL"
 done
 
 echo
 echo "== ceiling: every probed vector scored exactly (slow on purpose, fewer queries) =="
 $BIN bench --index "$DATA/idx-10M-$NLIST-rot-unbiased.bin" "${COMMON[@]}" \
   --nprobe 16,32,64,128 --rerank 1000000 --nq-latency 100 \
-  --csv results/ceiling.csv --label "$LABEL ceiling"
+  --csv results/ceiling-v2.csv --label "$LABEL ceiling"

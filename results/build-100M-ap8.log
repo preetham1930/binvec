@@ -1,0 +1,5 @@
+[build] k-means done in 402.4s
+[build] two-level assignment (probe 8): agrees with exact on 98.72% of a sample
+[build] assigned 100000000 vectors in 569.5s
+[build] encoded in 335.9s
+[build] total 1319.9s, saving to /home/preet_19/binvec-data/deep/idx-100M-16384-ap8.bin

@@ -24,4 +24,4 @@ echo "== 3/3 benchmark =="
 $BIN bench --index "$DATA/idx-10M-$NLIST-rot-unbiased.bin" --base "$DATA/base.10M.fbin" \
   --queries "$DATA/query.public.10K.fbin" --gt "$DATA/gt-10M.bin" \
   --nprobe 8,16,32,64,128 --rerank 0,100,200,500 \
-  --csv results/results.csv --label "deep10M nlist=$NLIST $(uname -n) v0.2"
+  --csv results/results-10M-v2.csv --label "deep10M nlist=$NLIST $(uname -n) v0.2"

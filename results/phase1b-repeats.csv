@@ -1,0 +1,7 @@
+label,n,nlist,nprobe,refine_k,rerank,recall10,p50_ms,p99_ms,mean_ms,qps,threads,ram_gb,t_centroids_ms,t_scan_ms,t_refine_ms,t_rerank_ms,major_faults,swap_in_pages,swap_out_pages
+"deep100M Preetham v0.4 cold rep1 rot+unbiased prefetch",100000000,16384,64,2000,20,0.9705,8.918,16.493,9.597,495,16,8.006,0.584,6.884,1.100,1.027,0,0,0
+"deep100M Preetham v0.4 cold rep1 rot+unbiased prefetch",100000000,16384,128,5000,50,0.9889,15.508,23.471,15.921,253,16,8.006,0.551,11.809,1.963,1.596,0,0,0
+"deep100M Preetham v0.4 cold rep2 rot+unbiased prefetch",100000000,16384,64,2000,20,0.9705,9.128,14.023,9.399,525,16,8.006,0.517,6.835,1.033,1.011,0,0,0
+"deep100M Preetham v0.4 cold rep2 rot+unbiased prefetch",100000000,16384,128,5000,50,0.9889,17.934,28.936,18.607,251,16,8.006,0.629,13.638,2.923,1.415,0,0,0
+"deep100M Preetham v0.4 cold rep3 rot+unbiased prefetch",100000000,16384,64,2000,20,0.9705,8.612,21.025,9.749,553,16,8.006,0.515,7.172,1.103,0.956,0,0,0
+"deep100M Preetham v0.4 cold rep3 rot+unbiased prefetch",100000000,16384,128,5000,50,0.9889,18.810,42.371,20.012,275,16,8.006,0.658,14.607,3.418,1.325,0,0,0

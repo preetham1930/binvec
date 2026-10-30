@@ -7,7 +7,8 @@
 
 use binvec::dist::l2sq;
 use binvec::io::{write_fbin, write_gt, Fbin, GroundTruth};
-use binvec::ivf::{BuildParams, Estimator, IvfIndex};
+use binvec::ivf::{BuildParams, Estimator, IvfIndex, SearchParams, StageTimes};
+use binvec::refine::Refine;
 use binvec::rng::Rng;
 use binvec::topk::{Hit, TopK};
 use clap::{Parser, Subcommand};
@@ -80,6 +81,21 @@ enum Cmd {
         /// How to scale the bit score: "unbiased" (RaBitQ, default) or "ls" (v0.1)
         #[arg(long, default_value = "unbiased")]
         estimator: String,
+        /// 0 = exact centroid assignment. N > 0 = two-level approximate assignment that checks
+        /// only the centroids in the N nearest groups (much faster at large nlist; try 8).
+        #[arg(long, default_value_t = 0)]
+        assign_probe: usize,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Build the 4-bit refine tier for an existing index (reads the base file once)
+    Refine {
+        #[arg(long)]
+        index: PathBuf,
+        #[arg(long)]
+        base: PathBuf,
+        #[arg(long)]
+        limit: Option<usize>,
         #[arg(long)]
         out: PathBuf,
     },
@@ -119,6 +135,16 @@ enum Cmd {
         /// Comma-separated rerank sizes (0 = no rerank)
         #[arg(long, default_value = "0,100,300")]
         rerank: String,
+        /// 4-bit refine tier file (from `binvec refine`); enables --refine-k
+        #[arg(long)]
+        refine: Option<PathBuf>,
+        /// Comma-separated: candidates kept from the 1-bit scan for the refine tier (0 = off)
+        #[arg(long, default_value = "0")]
+        refine_k: String,
+        /// Read index and refine arrays into owned memory instead of memory-mapping them
+        /// (the v0.3 behaviour; doubles peak memory while loading)
+        #[arg(long)]
+        copy_load: bool,
         /// Queries timed one by one on a single thread for latency percentiles
         #[arg(long, default_value_t = 2000)]
         nq_latency: usize,
@@ -194,6 +220,29 @@ fn exact_topk_many(base: &[f32], d: usize, queries: &[f32], k: usize) -> Vec<Vec
 fn recall_at(found: &[u32], truth: &[u32], k: usize) -> f64 {
     let truth = &truth[..k.min(truth.len())];
     found.iter().take(k).filter(|id| truth.contains(id)).count() as f64 / truth.len() as f64
+}
+
+/// This process's major page faults so far (each one waited for a disk read).
+/// Field 12 of /proc/self/stat; 0 where unavailable.
+fn major_faults() -> u64 {
+    std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|s| {
+            let after = s.rsplit_once(')')?.1;
+            after.split_whitespace().nth(9)?.parse().ok()
+        })
+        .unwrap_or(0)
+}
+
+/// System-wide pages swapped in and out so far (/proc/vmstat); (0, 0) where unavailable.
+fn swap_pages() -> (u64, u64) {
+    let s = std::fs::read_to_string("/proc/vmstat").unwrap_or_default();
+    let get = |key: &str| {
+        s.lines()
+            .find_map(|l| l.strip_prefix(key)?.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    (get("pswpin "), get("pswpout "))
 }
 
 fn pct(sorted: &[f64], p: f64) -> f64 {
@@ -290,6 +339,7 @@ fn main() -> std::io::Result<()> {
             seed,
             no_rotate,
             estimator,
+            assign_probe,
             out,
         } => {
             let base = Fbin::open(&base, limit)?;
@@ -307,6 +357,7 @@ fn main() -> std::io::Result<()> {
                         "unbiased" => Estimator::Unbiased,
                         other => panic!("unknown --estimator {other} (use ls or unbiased)"),
                     },
+                    assign_probe,
                 },
             );
             eprintln!(
@@ -315,6 +366,19 @@ fn main() -> std::io::Result<()> {
                 out.display()
             );
             idx.save(&out)?;
+        }
+
+        Cmd::Refine {
+            index,
+            base,
+            limit,
+            out,
+        } => {
+            let idx = IvfIndex::load(&index)?;
+            let base = Fbin::open(&base, limit)?;
+            let rf = Refine::build(&idx, &base);
+            rf.save(&out)?;
+            eprintln!("[refine] saved to {}", out.display());
         }
 
         Cmd::Ceiling {
@@ -357,6 +421,9 @@ fn main() -> std::io::Result<()> {
             k,
             nprobe,
             rerank,
+            refine,
+            refine_k,
+            copy_load,
             nq_latency,
             csv,
             label,
@@ -365,9 +432,23 @@ fn main() -> std::io::Result<()> {
             warmup,
         } => {
             let t = Instant::now();
-            let idx = IvfIndex::load(&index)?;
+            let idx = IvfIndex::load_with(&index, copy_load)?;
             eprintln!("[bench] index loaded in {:.1}s", t.elapsed().as_secs_f64());
             idx.print_balance();
+            let rf = match &refine {
+                Some(p) => {
+                    let t = Instant::now();
+                    let rf = Refine::load_with(p, copy_load)?;
+                    assert_eq!(rf.n, idx.n, "refine file does not match index");
+                    eprintln!(
+                        "[bench] refine tier loaded in {:.1}s ({:.2} GB)",
+                        t.elapsed().as_secs_f64(),
+                        rf.ram_bytes() as f64 / 1e9
+                    );
+                    Some(rf)
+                }
+                None => None,
+            };
             let base = Fbin::open(&base, limit)?;
             assert_eq!(
                 base.n, idx.n,
@@ -378,63 +459,117 @@ fn main() -> std::io::Result<()> {
             let nq = qs.n.min(gt.nq).min(nq_limit.unwrap_or(usize::MAX));
             let nl = nq_latency.min(nq);
             let threads = rayon::current_num_threads();
+            let ram_gb = (idx.ram_bytes() + rf.as_ref().map_or(0, |r| r.ram_bytes())) as f64 / 1e9;
 
+            const HEADER: &str = "label,n,nlist,nprobe,refine_k,rerank,recall10,p50_ms,p99_ms,mean_ms,qps,threads,ram_gb,t_centroids_ms,t_scan_ms,t_refine_ms,t_rerank_ms,major_faults,swap_in_pages,swap_out_pages";
             if let Some(dir) = csv.parent() {
                 std::fs::create_dir_all(dir)?;
+            }
+            if csv.exists() {
+                let first = std::fs::read_to_string(&csv)?
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                if first != HEADER {
+                    return Err(std::io::Error::other(format!(
+                        "{} has an older column layout; pass a new --csv file name",
+                        csv.display()
+                    )));
+                }
             }
             let new_file = !csv.exists();
             let mut out = OpenOptions::new().create(true).append(true).open(&csv)?;
             if new_file {
-                writeln!(
-                    out,
-                    "label,n,nlist,nprobe,rerank,recall10,p50_ms,p99_ms,mean_ms,qps,threads,ram_gb"
-                )?;
+                writeln!(out, "{HEADER}")?;
             }
 
             println!(
-                "{:>7} {:>7} {:>9} {:>8} {:>8} {:>8} {:>10}",
-                "nprobe", "rerank", "recall@10", "p50 ms", "p99 ms", "mean ms", "QPS"
+                "{:>6} {:>6} {:>6} {:>9} {:>8} {:>8} {:>8} {:>7}  | {:>6} {:>6} {:>6} {:>6} | {:>8} {:>7} {:>7}",
+                "nprobe",
+                "refine",
+                "rerank",
+                "recall@10",
+                "p50 ms",
+                "p99 ms",
+                "mean ms",
+                "QPS",
+                "cent",
+                "scan",
+                "refine",
+                "rerank",
+                "majflt",
+                "swapin",
+                "swapout"
             );
+            let refine_list = if rf.is_some() {
+                parse_list(&refine_k)
+            } else {
+                vec![0]
+            };
             for &np in &parse_list(&nprobe) {
-                for &rr in &parse_list(&rerank) {
-                    // Warm-up warms CPU caches and branch predictors, using queries the timed pass
-                    // never sees (from the end of the file).
-                    for i in (0..qs.n).rev().take(warmup.min(qs.n.saturating_sub(nl))) {
-                        idx.search(qs.vector(i), k, np, rr, Some(&base), prefetch);
-                    }
-                    // Latency: one query at a time, one thread.
-                    let mut lat = Vec::with_capacity(nl);
-                    for i in 0..nl {
+                for &rk in &refine_list {
+                    for &rr in &parse_list(&rerank) {
+                        let p = SearchParams {
+                            k,
+                            nprobe: np,
+                            refine_k: rk,
+                            rerank: rr,
+                            prefetch,
+                        };
+                        // Warm-up uses queries the timed pass never sees (from the end of the file).
+                        for i in (0..qs.n).rev().take(warmup.min(qs.n.saturating_sub(nl))) {
+                            idx.search(qs.vector(i), &p, rf.as_ref(), Some(&base), None);
+                        }
+                        // Latency: one query at a time, one thread, with a per-stage breakdown.
+                        let mut lat = Vec::with_capacity(nl);
+                        let mut st = StageTimes::default();
+                        let (f0, (si0, so0)) = (major_faults(), swap_pages());
+                        for i in 0..nl {
+                            let t = Instant::now();
+                            let hits = idx.search(
+                                qs.vector(i),
+                                &p,
+                                rf.as_ref(),
+                                Some(&base),
+                                Some(&mut st),
+                            );
+                            lat.push(t.elapsed().as_secs_f64() * 1e3);
+                            std::hint::black_box(hits);
+                        }
+                        let (f1, (si1, so1)) = (major_faults(), swap_pages());
+                        let (flt, sin, sout) = (f1 - f0, si1 - si0, so1 - so0);
+                        let mean = lat.iter().sum::<f64>() / nl as f64;
+                        lat.sort_by(|a, b| a.total_cmp(b));
+                        let ms = |x: f64| x * 1e3 / nl as f64;
+                        let (tc, ts, tr, tk) =
+                            (ms(st.centroids), ms(st.scan), ms(st.refine), ms(st.rerank));
+                        // Throughput and recall: all queries, all threads.
                         let t = Instant::now();
-                        let hits = idx.search(qs.vector(i), k, np, rr, Some(&base), prefetch);
-                        lat.push(t.elapsed().as_secs_f64() * 1e3);
-                        std::hint::black_box(hits);
+                        let total: f64 = (0..nq)
+                            .into_par_iter()
+                            .map(|i| {
+                                let hits =
+                                    idx.search(qs.vector(i), &p, rf.as_ref(), Some(&base), None);
+                                let ids: Vec<u32> = hits.iter().map(|h| h.id).collect();
+                                recall_at(&ids, gt.row(i), k)
+                            })
+                            .sum();
+                        let qps = nq as f64 / t.elapsed().as_secs_f64();
+                        let recall = total / nq as f64;
+                        let (p50, p99) = (pct(&lat, 0.50), pct(&lat, 0.99));
+                        println!(
+                            "{np:>6} {rk:>6} {rr:>6} {recall:>9.4} {p50:>8.3} {p99:>8.3} {mean:>8.3} {qps:>7.0}  | {tc:>6.2} {ts:>6.2} {tr:>6.2} {tk:>6.2} | {flt:>8} {sin:>7} {sout:>7}"
+                        );
+                        writeln!(
+                            out,
+                            "\"{label} {}{}\",{},{},{np},{rk},{rr},{recall:.4},{p50:.3},{p99:.3},{mean:.3},{qps:.0},{threads},{ram_gb:.3},{tc:.3},{ts:.3},{tr:.3},{tk:.3},{flt},{sin},{sout}",
+                            idx.variant(),
+                            if prefetch { " prefetch" } else { "" },
+                            idx.n,
+                            idx.nlist,
+                        )?;
                     }
-                    let mean = lat.iter().sum::<f64>() / nl as f64;
-                    lat.sort_by(|a, b| a.total_cmp(b));
-                    // Throughput: all queries, all threads.
-                    let t = Instant::now();
-                    let total: f64 = (0..nq)
-                        .into_par_iter()
-                        .map(|i| {
-                            let hits = idx.search(qs.vector(i), k, np, rr, Some(&base), prefetch);
-                            let ids: Vec<u32> = hits.iter().map(|h| h.id).collect();
-                            recall_at(&ids, gt.row(i), k)
-                        })
-                        .sum();
-                    let qps = nq as f64 / t.elapsed().as_secs_f64();
-                    let recall = total / nq as f64;
-                    let (p50, p99) = (pct(&lat, 0.50), pct(&lat, 0.99));
-                    println!("{np:>7} {rr:>7} {recall:>9.4} {p50:>8.3} {p99:>8.3} {mean:>8.3} {qps:>10.0}");
-                    writeln!(
-                        out,
-                        "\"{label} {}{}\",{},{},{np},{rr},{recall:.4},{p50:.3},{p99:.3},{mean:.3},{qps:.0},{threads},{:.3}",
-                        idx.variant(),
-                        if prefetch { " prefetch" } else { "" },
-                        idx.n,
-                        idx.nlist,
-                        idx.ram_bytes() as f64 / 1e9
-                    )?;
                 }
             }
             eprintln!("[bench] results appended to {}", csv.display());

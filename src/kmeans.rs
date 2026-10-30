@@ -124,7 +124,27 @@ pub fn norms(centroids: &[f32], d: usize) -> Vec<f32> {
 }
 
 /// Lloyd's algorithm on `sample` (n_s × d). Returns k·d centroids.
-pub fn train(sample: &[f32], d: usize, k: usize, iters: usize, seed: u64) -> Vec<f32> {
+/// `probe` > 0 uses the two-level approximate assignment (see `TwoLevel`) in each iteration.
+pub fn train(
+    sample: &[f32],
+    d: usize,
+    k: usize,
+    iters: usize,
+    seed: u64,
+    probe: usize,
+) -> Vec<f32> {
+    train_inner(sample, d, k, iters, seed, probe, true)
+}
+
+fn train_inner(
+    sample: &[f32],
+    d: usize,
+    k: usize,
+    iters: usize,
+    seed: u64,
+    probe: usize,
+    verbose: bool,
+) -> Vec<f32> {
     let n = sample.len() / d;
     assert!(n >= k, "need at least k sample points ({n} < {k})");
     let mut rng = Rng::new(seed);
@@ -140,9 +160,13 @@ pub fn train(sample: &[f32], d: usize, k: usize, iters: usize, seed: u64) -> Vec
     }
 
     for it in 0..iters {
-        let cn = norms(&centroids, d);
         // Assignment is the expensive part and runs in parallel; summing is cheap and serial.
-        let assign = assign_all(sample, d, &centroids, &cn);
+        let assign = if probe > 0 {
+            TwoLevel::new(&centroids, d, probe, seed ^ it as u64).assign_all(sample)
+        } else {
+            let cn = norms(&centroids, d);
+            assign_all(sample, d, &centroids, &cn)
+        };
         let mut sums = vec![0.0f64; k * d];
         let mut counts = vec![0u64; k];
         let mut inertia = 0.0f64;
@@ -169,18 +193,132 @@ pub fn train(sample: &[f32], d: usize, k: usize, iters: usize, seed: u64) -> Vec
                 }
             }
         }
-        eprintln!(
-            "  kmeans iter {:>2}/{iters}: mean sq dist {:.5}, empty clusters {empty}",
-            it + 1,
-            inertia / n as f64
-        );
+        if verbose {
+            eprintln!(
+                "  kmeans iter {:>2}/{iters}: mean sq dist {:.5}, empty clusters {empty}",
+                it + 1,
+                inertia / n as f64
+            );
+        }
     }
     centroids
+}
+
+/// Two-level approximate nearest-centroid search, for building large indexes.
+///
+/// Exact assignment compares each vector with all k centroids (16,384 at 100M: 70% of the build).
+/// Here the centroids themselves are clustered into ~sqrt(k) groups. A vector is compared with
+/// the group centres, then only with the centroids in its `probe` nearest groups:
+/// sqrt(k) + probe·sqrt(k) dot products instead of k (≈1,150 instead of 16,384 for probe 8).
+/// The price is that a vector near a group boundary can land in its second-nearest centroid;
+/// `agreement` measures how often that happens.
+pub struct TwoLevel {
+    d: usize,
+    probe: usize,
+    coarse: Vec<f32>,
+    coarse_norms: Vec<f32>,
+    /// Group g's centroids are grouped[starts[g]..starts[g+1]] (rows of d floats).
+    starts: Vec<usize>,
+    grouped: Vec<f32>,
+    grouped_norms: Vec<f32>,
+    /// Original index of each grouped centroid.
+    members: Vec<u32>,
+}
+
+impl TwoLevel {
+    pub fn new(centroids: &[f32], d: usize, probe: usize, seed: u64) -> Self {
+        let k = centroids.len() / d;
+        let ck = ((k as f64).sqrt().round() as usize).clamp(1, k);
+        let coarse = train_inner(centroids, d, ck, 10, seed ^ 0xC0A5, 0, false);
+        let coarse_norms = norms(&coarse, d);
+        let owner = assign_all(centroids, d, &coarse, &coarse_norms);
+        let mut starts = vec![0usize; ck + 1];
+        for &g in &owner {
+            starts[g as usize + 1] += 1;
+        }
+        for g in 0..ck {
+            starts[g + 1] += starts[g];
+        }
+        let mut cursor = starts.clone();
+        let mut grouped = vec![0f32; k * d];
+        let mut members = vec![0u32; k];
+        for (c, &g) in owner.iter().enumerate() {
+            let m = cursor[g as usize];
+            cursor[g as usize] += 1;
+            grouped[m * d..(m + 1) * d].copy_from_slice(&centroids[c * d..(c + 1) * d]);
+            members[m] = c as u32;
+        }
+        let grouped_norms = norms(&grouped, d);
+        TwoLevel {
+            d,
+            probe: probe.clamp(1, ck),
+            coarse,
+            coarse_norms,
+            starts,
+            grouped,
+            grouped_norms,
+            members,
+        }
+    }
+
+    #[inline]
+    fn nearest(&self, x: &[f32], scratch: &mut Vec<(f32, u32)>) -> u32 {
+        let d = self.d;
+        scratch.clear();
+        for (g, c) in self.coarse.chunks_exact(d).enumerate() {
+            scratch.push((self.coarse_norms[g] - 2.0 * dot(x, c), g as u32));
+        }
+        let p = self.probe;
+        if p < scratch.len() {
+            scratch.select_nth_unstable_by(p - 1, |a, b| a.0.total_cmp(&b.0));
+        }
+        let mut best = f32::INFINITY;
+        let mut best_m = 0usize;
+        for &(_, g) in scratch.iter().take(p) {
+            let (lo, hi) = (self.starts[g as usize], self.starts[g as usize + 1]);
+            for m in lo..hi {
+                let s = self.grouped_norms[m] - 2.0 * dot(x, &self.grouped[m * d..(m + 1) * d]);
+                if s < best {
+                    best = s;
+                    best_m = m;
+                }
+            }
+        }
+        self.members[best_m]
+    }
+
+    pub fn assign_all(&self, data: &[f32]) -> Vec<u32> {
+        data.par_chunks(self.d)
+            .map_init(Vec::new, |scratch, x| self.nearest(x, scratch))
+            .collect()
+    }
+
+    /// Fraction of `sample` vectors assigned to the same centroid as exact search would pick.
+    pub fn agreement(&self, sample: &[f32], centroids: &[f32]) -> f64 {
+        let cn = norms(centroids, self.d);
+        let approx = self.assign_all(sample);
+        let exact = assign_all(sample, self.d, centroids, &cn);
+        approx.iter().zip(&exact).filter(|(a, b)| a == b).count() as f64 / approx.len() as f64
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_level_with_full_probe_is_exact() {
+        let (d, k, n) = (32, 400, 500);
+        let mut rng = Rng::new(2);
+        let cents: Vec<f32> = (0..k * d).map(|_| rng.normal()).collect();
+        let data: Vec<f32> = (0..n * d).map(|_| rng.normal()).collect();
+        // Probing every group must give exactly the exact answer.
+        let t = TwoLevel::new(&cents, d, usize::MAX, 3);
+        assert_eq!(t.agreement(&data, &cents), 1.0);
+        // A small probe is approximate but should still mostly agree.
+        let t = TwoLevel::new(&cents, d, 4, 3);
+        assert!(t.agreement(&data, &cents) > 0.5);
+    }
 
     #[test]
     fn batched_matches_single() {

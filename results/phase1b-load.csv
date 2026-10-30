@@ -1,0 +1,3 @@
+label,n,nlist,nprobe,refine_k,rerank,recall10,p50_ms,p99_ms,mean_ms,qps,threads,ram_gb,t_centroids_ms,t_scan_ms,t_refine_ms,t_rerank_ms,major_faults,swap_in_pages,swap_out_pages
+"deep100M Preetham v0.4 copy-load rot+unbiased prefetch",100000000,16384,128,5000,50,0.9889,71.362,251.318,86.056,96,16,8.006,0.532,48.728,30.399,6.394,0,0,0
+"deep100M Preetham v0.4 mmap rot+unbiased prefetch",100000000,16384,128,5000,50,0.9889,15.469,23.240,15.702,521,16,8.006,0.464,9.034,1.530,4.672,0,0,0

@@ -19,7 +19,7 @@ BIN=$CARGO_TARGET_DIR/release/binvec
 NLIST=${NLIST:-16384}
 IDX="$DATA/idx-100M-$NLIST-rot-unbiased.bin"
 LABEL="deep100M nlist=$NLIST $(uname -n) v0.3 cold"
-CSV=results/results-100M-cold.csv
+CSV=results/results-100M-cold-v2.csv
 
 cargo build --release
 mkdir -p results
@@ -35,7 +35,7 @@ trap 'kill $KEEPALIVE 2>/dev/null' EXIT
 for mode in "--prefetch" ""; do
   echo
   echo "== cold-cache benchmark ${mode:-without prefetch} =="
-  echo " nprobe  rerank recall@10   p50 ms   p99 ms  mean ms        QPS"
+  echo "nprobe refine rerank recall@10   p50 ms   p99 ms  mean ms     QPS  |   cent   scan refine rerank"
   for np in 32 64 128; do
     for rr in 100 200 500 1000; do
       drop_caches

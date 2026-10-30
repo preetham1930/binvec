@@ -28,14 +28,16 @@
 //! we precompute all 256 partial sums of ±r' over those 8 dims, once per (query, list). Scoring
 //! a vector is then d/8 lookups and adds (12 for d = 96), no multiplications.
 
+use crate::buf::{map_file, Buf};
 use crate::dist::{dot, l2sq};
 use crate::io::Fbin;
 use crate::kmeans;
+use crate::refine::Refine;
 use crate::rng::Rng;
 use crate::topk::{Hit, TopK};
 use rayon::prelude::*;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Result, Write};
+use std::io::{BufWriter, Result, Write};
 use std::path::Path;
 use std::time::Instant;
 
@@ -69,10 +71,10 @@ pub struct IvfIndex {
     cnorms: Vec<f32>,
     /// Vectors of list c are at positions offsets[c]..offsets[c+1].
     pub offsets: Vec<u64>,
-    pub ids: Vec<u32>,
-    pub codes: Vec<u8>,
-    pub scale: Vec<f32>,
-    pub rnorm: Vec<f32>,
+    pub ids: Buf<u32>,
+    pub codes: Buf<u8>,
+    pub scale: Buf<f32>,
+    pub rnorm: Buf<f32>,
 }
 
 pub struct BuildParams {
@@ -82,11 +84,45 @@ pub struct BuildParams {
     pub seed: u64,
     pub rotate: bool,
     pub estimator: Estimator,
+    /// 0 = exact centroid assignment; > 0 = two-level approximate assignment probing this many
+    /// groups of centroids (see `kmeans::TwoLevel`). Much faster for large nlist.
+    pub assign_probe: usize,
+}
+
+/// Per-query search settings.
+#[derive(Clone, Copy, Debug)]
+pub struct SearchParams {
+    pub k: usize,
+    pub nprobe: usize,
+    /// Candidates kept from the 1-bit scan for the 4-bit refine tier (0 = no refine tier).
+    pub refine_k: usize,
+    /// Candidates rescored exactly from the full vectors on disk (0 = no rerank).
+    pub rerank: usize,
+    /// Start all rerank reads before computing any.
+    pub prefetch: bool,
+}
+
+/// Time spent in each stage of one search, in seconds.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StageTimes {
+    pub centroids: f64,
+    pub scan: f64,
+    pub refine: f64,
+    pub rerank: f64,
+}
+
+impl StageTimes {
+    pub fn add(&mut self, o: &StageTimes) {
+        self.centroids += o.centroids;
+        self.scan += o.scan;
+        self.refine += o.refine;
+        self.rerank += o.rerank;
+    }
 }
 
 /// Raw pointer we can share across threads; each thread writes disjoint slots.
 #[derive(Clone, Copy)]
-struct SyncPtr<T>(*mut T);
+pub(crate) struct SyncPtr<T>(pub(crate) *mut T);
 unsafe impl<T> Send for SyncPtr<T> {}
 unsafe impl<T> Sync for SyncPtr<T> {}
 
@@ -119,7 +155,7 @@ pub fn identity(d: usize) -> Vec<f32> {
 
 /// out = P · x
 #[inline]
-fn matvec(p: &[f32], x: &[f32], out: &mut [f32]) {
+pub fn matvec(p: &[f32], x: &[f32], out: &mut [f32]) {
     let d = x.len();
     for (i, o) in out.iter_mut().enumerate() {
         *o = dot(&p[i * d..(i + 1) * d], x);
@@ -159,14 +195,25 @@ impl IvfIndex {
             "[build] training k-means: {train_n} points -> {} lists",
             p.nlist
         );
-        let centroids = kmeans::train(&sample, d, p.nlist, p.iters, p.seed);
-        drop(sample);
+        let centroids = kmeans::train(&sample, d, p.nlist, p.iters, p.seed, p.assign_probe);
         let cnorms = kmeans::norms(&centroids, d);
         eprintln!("[build] k-means done in {:.1}s", t.elapsed().as_secs_f64());
 
         // 2. Assign every vector to its nearest centroid.
         let t = Instant::now();
-        let assign = kmeans::assign_all(data, d, &centroids, &cnorms);
+        let assign = if p.assign_probe > 0 {
+            let two = kmeans::TwoLevel::new(&centroids, d, p.assign_probe, p.seed);
+            let check_n = (train_n.min(20_000)) * d;
+            eprintln!(
+                "[build] two-level assignment (probe {}): agrees with exact on {:.2}% of a sample",
+                p.assign_probe,
+                100.0 * two.agreement(&sample[..check_n], &centroids)
+            );
+            two.assign_all(data)
+        } else {
+            kmeans::assign_all(data, d, &centroids, &cnorms)
+        };
+        drop(sample);
         eprintln!(
             "[build] assigned {n} vectors in {:.1}s",
             t.elapsed().as_secs_f64()
@@ -274,13 +321,18 @@ impl IvfIndex {
             centroids: rcent,
             cnorms,
             offsets,
-            ids,
-            codes,
-            scale,
-            rnorm,
+            ids: ids.into(),
+            codes: codes.into(),
+            scale: scale.into(),
+            rnorm: rnorm.into(),
         };
         idx.print_balance();
         idx
+    }
+
+    /// The d×d rotation matrix (identity when `rotate` is false).
+    pub fn rotation(&self) -> &[f32] {
+        &self.rot
     }
 
     pub fn print_balance(&self) {
@@ -354,23 +406,25 @@ impl IvfIndex {
             .collect()
     }
 
-    /// Search one query.
-    /// - `nprobe`: how many nearest lists to scan (more = better recall, slower)
-    /// - `rerank`: how many best code-scored candidates to rescore exactly (0 = no rerank)
-    /// - `prefetch`: start all rerank reads before computing any (helps when the full vectors
-    ///   are on disk rather than in the page cache)
+    /// Search one query. Stages:
+    /// 1. pick the `nprobe` nearest lists;
+    /// 2. score every vector in them from its 1-bit code, keep the best `refine_k` (or `rerank`);
+    /// 3. (optional) rescore those from the 4-bit `refine` codes in RAM, keep the best `rerank`;
+    /// 4. (optional) rescore those exactly from the full vectors in `base` (on disk), keep `k`.
+    /// Pass `times` to get how long each stage took.
     pub fn search(
         &self,
         q: &[f32],
-        k: usize,
-        nprobe: usize,
-        rerank: usize,
+        p: &SearchParams,
+        refine: Option<&Refine>,
         base: Option<&Fbin>,
-        prefetch: bool,
+        times: Option<&mut StageTimes>,
     ) -> Vec<Hit> {
         let d = self.d;
         let cb = self.code_bytes();
-        let nprobe = nprobe.min(self.nlist);
+        let nprobe = p.nprobe.min(self.nlist);
+        let k = p.k;
+        let t0 = Instant::now();
 
         // Rotate the query once; distances to rotated centroids equal distances to originals.
         let mut qr = vec![0f32; d];
@@ -380,11 +434,20 @@ impl IvfIndex {
             qr.copy_from_slice(q);
         }
 
-        // Step 1: nearest lists.
+        // Stage 1: nearest lists.
         let cd = self.nearest_lists(&qr, nprobe);
+        let t1 = Instant::now();
 
-        // Step 2: scan the codes of those lists.
-        let keep = if rerank > 0 { rerank.max(k) } else { k };
+        // Stage 2: scan the 1-bit codes of those lists. Candidates are kept by *slot* (position
+        // in list order), which is where the refine codes live; ids are looked up at the end.
+        let use_refine = refine.is_some() && p.refine_k > 0;
+        let keep = if use_refine {
+            p.refine_k.max(p.rerank).max(k)
+        } else if p.rerank > 0 {
+            p.rerank.max(k)
+        } else {
+            k
+        };
         let mut cand = TopK::new(keep);
         let mut r = vec![0f32; d];
         let mut lut = vec![0f32; cb * 256];
@@ -407,32 +470,64 @@ impl IvfIndex {
                 let slot = lo + v;
                 let est = rr + self.rnorm[slot] - 2.0 * self.scale[slot] * s;
                 if est < cand.threshold() {
-                    cand.push(est, self.ids[slot]);
+                    cand.push(est, slot as u32);
                 }
             }
         }
+        let mut cand = cand.into_sorted();
+        let t2 = Instant::now();
 
-        // Step 3: exact rescoring from the full (unrotated) vectors on disk.
-        match (rerank > 0, base) {
+        // Stage 3: 4-bit refine in RAM.
+        if let (true, Some(rf)) = (use_refine, refine) {
+            let want = if p.rerank > 0 { p.rerank.max(k) } else { k };
+            let mut better = TopK::new(want);
+            for h in &cand {
+                let slot = h.id as usize;
+                // Which list is this slot in? offsets is sorted, so binary search.
+                let c = self.offsets.partition_point(|&o| o as usize <= slot) - 1;
+                let cen = &self.centroids[c * d..(c + 1) * d];
+                for j in 0..d {
+                    r[j] = qr[j] - cen[j];
+                }
+                better.push(rf.dist(slot, &r), h.id);
+            }
+            cand = better.into_sorted();
+        }
+        let t3 = Instant::now();
+
+        // Stage 4: exact rescoring from the full (unrotated) vectors on disk.
+        let out = match (p.rerank > 0, base) {
             (true, Some(base)) => {
-                let cand = cand.into_sorted();
-                if prefetch {
+                if p.prefetch {
                     for h in &cand {
-                        base.prefetch(h.id as usize);
+                        base.prefetch(self.ids[h.id as usize] as usize);
                     }
                 }
                 let mut out = TopK::new(k);
                 for h in &cand {
-                    out.push(l2sq(q, base.vector(h.id as usize)), h.id);
+                    let id = self.ids[h.id as usize];
+                    out.push(l2sq(q, base.vector(id as usize)), id);
                 }
                 out.into_sorted()
             }
             _ => {
-                let mut v = cand.into_sorted();
-                v.truncate(k);
-                v
+                cand.truncate(k);
+                cand.iter()
+                    .map(|h| Hit {
+                        dist: h.dist,
+                        id: self.ids[h.id as usize],
+                    })
+                    .collect()
             }
+        };
+        if let Some(t) = times {
+            let t4 = Instant::now();
+            t.centroids += (t1 - t0).as_secs_f64();
+            t.scan += (t2 - t1).as_secs_f64();
+            t.refine += (t3 - t2).as_secs_f64();
+            t.rerank += (t4 - t3).as_secs_f64();
         }
+        out
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -446,36 +541,61 @@ impl IvfIndex {
         write_pod(&mut w, &self.rot)?;
         write_pod(&mut w, &self.centroids)?;
         write_pod(&mut w, &self.offsets)?;
-        write_pod(&mut w, &self.ids)?;
-        write_pod(&mut w, &self.codes)?;
-        write_pod(&mut w, &self.scale)?;
-        write_pod(&mut w, &self.rnorm)?;
+        write_pod(&mut w, &self.ids[..])?;
+        write_pod(&mut w, &self.codes[..])?;
+        write_pod(&mut w, &self.scale[..])?;
+        write_pod(&mut w, &self.rnorm[..])?;
         w.flush()
     }
 
+    /// Load an index. The big per-vector arrays are memory-mapped (see `buf.rs`) and pre-read,
+    /// so they live in RAM once. `copy = true` reads them into owned memory instead (v0.3
+    /// behaviour, kept to measure the difference).
     pub fn load(path: &Path) -> Result<Self> {
-        let mut r = BufReader::with_capacity(1 << 22, File::open(path)?);
-        let mut magic = [0u8; 8];
-        r.read_exact(&mut magic)?;
-        if &magic != MAGIC {
+        Self::load_with(path, false)
+    }
+
+    pub fn load_with(path: &Path, copy: bool) -> Result<Self> {
+        let map = map_file(path, true)?;
+        if map.len() < 40 || &map[0..8] != MAGIC {
             return Err(std::io::Error::other(
                 "not a binvec v0.2 index file (rebuild it with `binvec build`)",
             ));
         }
-        let mut u = [0u8; 8];
-        let mut next = || -> Result<usize> {
-            r.read_exact(&mut u)?;
-            Ok(u64::from_le_bytes(u) as usize)
-        };
-        let (d, nlist, n, flags) = (next()?, next()?, next()?, next()?);
+        let word =
+            |i: usize| u64::from_le_bytes(map[8 + 8 * i..16 + 8 * i].try_into().unwrap()) as usize;
+        let (d, nlist, n, flags) = (word(0), word(1), word(2), word(3));
         let cb = d / 8;
-        let rot: Vec<f32> = read_pod(&mut r, d * d)?;
-        let centroids: Vec<f32> = read_pod(&mut r, nlist * d)?;
-        let offsets: Vec<u64> = read_pod(&mut r, nlist + 1)?;
-        let ids: Vec<u32> = read_pod(&mut r, n)?;
-        let codes: Vec<u8> = read_pod(&mut r, n * cb)?;
-        let scale: Vec<f32> = read_pod(&mut r, n)?;
-        let rnorm: Vec<f32> = read_pod(&mut r, n)?;
+        let mut off = 40;
+        // Small arrays: always copied. Big arrays: mapped unless `copy`.
+        let rot: Buf<f32> = Buf::copied(&map, off, d * d);
+        off += d * d * 4;
+        let centroids: Buf<f32> = Buf::copied(&map, off, nlist * d);
+        off += nlist * d * 4;
+        let offsets: Buf<u64> = Buf::copied(&map, off, nlist + 1);
+        off += (nlist + 1) * 8;
+        let big =
+            |off: usize, len: usize, size: usize| -> (usize, usize) { (off, off + len * size) };
+        let (o_ids, next) = big(off, n, 4);
+        let (o_codes, next) = big(next, n * cb, 1);
+        let (o_scale, next) = big(next, n, 4);
+        let (o_rnorm, _) = big(next, n, 4);
+        let (ids, codes, scale, rnorm): (Buf<u32>, Buf<u8>, Buf<f32>, Buf<f32>) = if copy {
+            (
+                Buf::copied(&map, o_ids, n),
+                Buf::copied(&map, o_codes, n * cb),
+                Buf::copied(&map, o_scale, n),
+                Buf::copied(&map, o_rnorm, n),
+            )
+        } else {
+            (
+                Buf::mapped(&map, o_ids, n),
+                Buf::mapped(&map, o_codes, n * cb),
+                Buf::mapped(&map, o_scale, n),
+                Buf::mapped(&map, o_rnorm, n),
+            )
+        };
+        let centroids = centroids.to_vec();
         let cnorms = kmeans::norms(&centroids, d);
         Ok(IvfIndex {
             d,
@@ -487,10 +607,10 @@ impl IvfIndex {
             } else {
                 Estimator::LeastSquares
             },
-            rot,
+            rot: rot.to_vec(),
             centroids,
             cnorms,
-            offsets,
+            offsets: offsets.to_vec(),
             ids,
             codes,
             scale,
@@ -517,25 +637,16 @@ pub fn build_lut(r: &[f32], lut: &mut [f32]) {
 }
 
 /// Plain-old-data types we can write as raw little-endian bytes (x86/ARM are little-endian).
-trait Pod: Copy + Default {}
+pub trait Pod: Copy + Default {}
 impl Pod for u8 {}
 impl Pod for u32 {}
 impl Pod for u64 {}
 impl Pod for f32 {}
 
-fn write_pod<T: Pod, W: Write>(w: &mut W, v: &[T]) -> Result<()> {
+pub(crate) fn write_pod<T: Pod, W: Write>(w: &mut W, v: &[T]) -> Result<()> {
     let bytes =
         unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) };
     w.write_all(bytes)
-}
-
-fn read_pod<T: Pod, R: Read>(r: &mut R, len: usize) -> Result<Vec<T>> {
-    let mut v = vec![T::default(); len];
-    let bytes = unsafe {
-        std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, len * std::mem::size_of::<T>())
-    };
-    r.read_exact(bytes)?;
-    Ok(v)
 }
 
 #[cfg(test)]
