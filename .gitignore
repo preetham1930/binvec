@@ -1,0 +1,7 @@
+/target
+*.part
+*.fbin
+*.bin
+!results/*.csv
+# personal study notes, kept local
+docs/LEARN.md

@@ -1,0 +1,5 @@
+label,n,nlist,nprobe,rerank,recall10,p50_ms,p99_ms,mean_ms,qps,threads,ram_gb
+"deep10M nlist=4096 Preetham v0.2 ceiling rot+unbiased",10000000,4096,16,1000000,0.9130,10.995,20.124,11.823,536,16,0.242
+"deep10M nlist=4096 Preetham v0.2 ceiling rot+unbiased",10000000,4096,32,1000000,0.9621,20.913,38.084,22.176,243,16,0.242
+"deep10M nlist=4096 Preetham v0.2 ceiling rot+unbiased",10000000,4096,64,1000000,0.9856,43.625,66.774,44.424,132,16,0.242
+"deep10M nlist=4096 Preetham v0.2 ceiling rot+unbiased",10000000,4096,128,1000000,0.9953,86.722,126.792,89.728,59,16,0.242

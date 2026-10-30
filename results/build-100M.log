@@ -1,0 +1,16 @@
+[build] training k-means: 1000000 points -> 16384 lists
+  kmeans iter  1/10: mean sq dist 0.54038, empty clusters 4
+  kmeans iter  2/10: mean sq dist 0.38862, empty clusters 0
+  kmeans iter  3/10: mean sq dist 0.37668, empty clusters 0
+  kmeans iter  4/10: mean sq dist 0.37178, empty clusters 0
+  kmeans iter  5/10: mean sq dist 0.36905, empty clusters 0
+  kmeans iter  6/10: mean sq dist 0.36734, empty clusters 0
+  kmeans iter  7/10: mean sq dist 0.36617, empty clusters 0
+  kmeans iter  8/10: mean sq dist 0.36533, empty clusters 0
+  kmeans iter  9/10: mean sq dist 0.36471, empty clusters 0
+  kmeans iter 10/10: mean sq dist 0.36424, empty clusters 0
+[build] k-means done in 631.7s
+[build] assigned 100000000 vectors in 2209.8s
+[build] encoded in 318.8s
+[index] 100000000 vectors, 16384 lists (rot+unbiased), list size min 1 / mean 6104 / max 31072, RAM 2.41 GB
+[build] total 3174.5s, saving to /home/preet_19/binvec-data/deep/idx-100M-16384-rot-unbiased.bin

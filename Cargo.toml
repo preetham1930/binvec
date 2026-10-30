@@ -1,0 +1,18 @@
+[package]
+name = "binvec"
+version = "0.1.0"
+edition = "2021"
+description = "Billion-scale approximate nearest neighbour search: IVF + residual binary codes + exact rerank"
+license = "MIT"
+
+[dependencies]
+memmap2 = "0.9"
+rayon = "1.10"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = 1          # keep symbols so `perf` can show where time goes
+panic = "abort"
